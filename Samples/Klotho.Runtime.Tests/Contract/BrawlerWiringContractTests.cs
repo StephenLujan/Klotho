@@ -250,15 +250,27 @@ namespace xpTURN.Klotho.Runtime.Tests.Contract
         ///
         /// <para>It also hard-coded a cell size measured on one asset. Both belong where the tuning
         /// actually in effect can be read, which is not here.</para>
+        ///
+        /// <para>Since 0.13 the delegation has one less step: the sample does not call the engine
+        /// helper either. <c>FPNavAgentSystem</c>'s constructor runs the same ladder itself when
+        /// <c>FPNavTuning.AutoInstallAbstractGraph</c> is on, so what is left to pin is the mesh the
+        /// system is constructed on — the ladder's cell choice is part of the fingerprint, and the
+        /// engine's FullState correction swaps a late joiner forward from the same BASE mesh, so a
+        /// different mesh here makes peers derive different graphs.</para>
         /// </summary>
         [Test]
         public void LegPlanning_IsDelegatedToTheEngine_NotReDerivedInTheSample()
         {
             string src = ReadBrawler("Manager/BrawlerSimulationCallbacks.cs");
 
-            Assert.IsTrue(Regex.IsMatch(src, @"TryInstallAbstractGraphIfBeneficial\s*\("),
-                "the sample no longer goes through the engine helper — whatever replaced it has to "
-                + "answer both thresholds from the tuning in effect, which is what the helper is for");
+            Assert.IsTrue(Regex.IsMatch(src, @"new\s+FPNavAgentSystem\s*\(\s*_navMesh"),
+                "the agent system is no longer constructed on the BASE mesh — since 0.13 the "
+                + "constructor is what decides legs, and its cell choice is part of the fingerprint, "
+                + "so a different mesh here makes peers derive different graphs");
+
+            Assert.IsFalse(Regex.IsMatch(src, @"SetAbstractGraph\s*\("),
+                "the sample installs a graph by hand again — the condition and the cell size "
+                + "belong to the tuning in effect (FPNavTuning.AutoInstallAbstractGraph), not here");
 
             Assert.IsFalse(Regex.IsMatch(src, @"new\s+FPNavAbstractGraph\s*\("),
                 "the sample builds its own graph again, which means it also picked a cell size — "
