@@ -968,6 +968,30 @@ Even on a 22k-triangle stage, placing a building is kilobytes.
 > those three objects, and each is sized from the triangle count — about **1.4 MB per placement** on
 > Field. Use it only if you own the instances for some other reason.
 
+#### The exception: planning in legs
+
+*Installing the result is free* stops being true if you also plan in legs
+([Navigation.md § Planning in legs](./Navigation.md#planning-in-legs)). That graph is **derived from
+the mesh**, so replacing the mesh rebuilds it, and the rebuild happens inside the swap rather than
+across the slices:
+
+| Asset | Triangles | Derivation | Against the 2.13 ms slice budget |
+| --- | ---: | ---: | --- |
+| **Field** | 22,321 | **10.15 ms** | **~5× over** |
+| Stage01 | 116 | 0.09 ms | comfortable |
+| Stage02 | 60 | 0.06 ms | comfortable |
+
+Field's figure is at cell 32, the size the install helper settles on for that asset; a smaller cell
+costs more (13.4 ms at 16, 46.1 ms at 4). All three are Release builds.
+
+**That cost no longer lands on the swap frame, and you do not have to do anything to avoid it.**
+The engine builds the graph one frame boundary earlier, from the mesh the rebake driver already
+finished, and the swap adopts it — see [the section on preparing it](#work-that-must-happen-when-a-mesh-goes-live-but-not-on-the-tick).
+It still lands there in the cases a preparation cannot exist: the driver served the mesh from its
+cache, or rebuilt it synchronously because a boundary tick arrived before the slices finished.
+`FPNavAgentSystem.DebugGraphPreparedAdoptedCount` against `DebugGraphRederiveCount` says which you
+are getting. On a static mesh the question never arises — the graph is derived once.
+
 ### The per-frame preview
 
 `TryValidateOne` answers without carving anything, so it is the call a placement UI makes as the
@@ -1227,6 +1251,7 @@ owns three things:
 | What the engine does | When |
 | --- | --- |
 | `AdvanceSlice` on every frame | `Update`, ahead of every per-mode early return — so it reaches a server-driven client too, which never runs world init |
+| `INavGraphPreparer.PrepareAbstractGraphFor(driver.PeekPreparedMesh)` | the same line, immediately after — see below |
 | `CorrectNow` to establish the invariant | right after `OnInitializeWorld`, before the static fingerprint is sampled and before the initial full state goes out |
 | `CorrectNow` to re-establish it | on every full-state apply, before your `OnFullStateApplied` hook, sharing that hook's `DerivativeRebuildFailed` outcome |
 
@@ -1249,10 +1274,43 @@ absence of the net that would tell you if it did.
 **Opt-in is the registration itself, and there is no opt-out.** A game that registers no driver pays
 a null check at each of those points; a game that registers one cannot pace slices itself.
 
+### Work that must happen when a mesh goes live, but not on the tick
+
+Installing a mesh makes some things stale that are neither state nor cheap. The one this seam exists
+for is the abstract graph behind [planning in legs](Navigation.md): a swap re-derives it whole, on
+the deterministic command path, and that costs **10.15 ms on the Field asset at the cell size the
+install helper picks** — against the 2.13 ms this driver's slicing works to stay inside.
+
+It does not have to be paid there. The graph is a pure function of `(mesh, cell size, cost fold,
+area mask)`, so it can be built the moment the mesh exists — one frame boundary earlier, off the
+tick — and simply adopted when the swap arrives.
+
+**The engine does it, and a game writes nothing.** Register a navigation system that implements
+`INavGraphPreparer` — `FPNavAgentSystem` does — and the frame heartbeat that paces slices also hands
+it `PeekPreparedMesh`. There is no method to call and none to forget.
+
+**Forgetting is the reason it is not yours.** A missed preparation breaks nothing: the swap derives
+synchronously and produces the *same* graph, with the same checksum and the same fingerprint. Peers
+may disagree about whether they prepared, run at different frame rates, or mix a game that wires
+this with one that does not — routes are identical either way. Which is precisely why a game would
+never learn it had forgotten; the only symptom is a tick that costs more.
+
+**It does not always land**, and the counters say so. `PeekPreparedMesh` is null on the cache-hit and
+rebuild paths, and on a boundary that finishes its own task — those installs still derive on the
+tick. Read `FPNavAgentSystem.DebugGraphPreparedAdoptedCount` against `DebugGraphPreparedMissedCount`
+and `DebugGraphRederiveCount`, beside the driver's own `CacheHits` and `RebuildInstalls`.
+
+**Adoption is by reference AND fingerprint.** Node ids index one mesh's triangles, so the graph must
+be the one built for that instance; and because meshes are pooled and a commit retires the one it
+replaces, a reference can be recycled and rewritten — so the content is checked too. A graph over
+geometry that is no longer there would be installed identically on every peer, with the state hash
+agreeing and nothing reporting it.
+
 | Member | Purpose |
 | --- | --- |
 | `driver.CorrectNow(ref frame)` | Re-derive right now. Still public: a game with its own reason to correct may call it |
 | `driver.AdvanceSlice(deltaTime)` | Advance an in-flight rebake by one frame's budget. The engine calls this; a host without the engine can call it directly |
+| `driver.PeekPreparedMesh` | The mesh a FINISHED slice task is holding, before any tick installs it — null while one is still running, and null when the next install will come from the cache or a synchronous rebuild. Reading it moves nothing |
 | `driver.TryClaimSliceHeartbeat()` | **You do not need this.** The engine claims it at `Initialize`, so a later caller is told "someone else is pacing" — which is how hand-written wiring steps aside on its own. Pacing happens either way |
 | `IFPNavMeshPlacementSource` | **Yours.** `Capacity` · `Collect(ref frame, buffer, out eligible)` · `DestroyDue(ref frame, tick)` |
 | `IFPNavMeshInstaller` | **Yours.** `Install(ref frame, mesh)` and `Reseed(ref frame)` — two calls, never one |

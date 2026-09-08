@@ -40,8 +40,35 @@ namespace xpTURN.Klotho.Editor
         private bool _foldoutGrid;
         private bool _foldoutInfo;
         private bool _foldoutBuildings = true;
+        private bool _foldoutCounters;
         private string _spawnStartText = "0.0, 0.0, 0.0";
         private string _spawnDestText = "1.0, 0.0, 1.0";
+
+        // Tool tuning INPUT — what the next load builds the stack with. The loaded value is
+        // _data.ToolTuning; the two drift apart between editing and reloading, and the section
+        // says so. Only the two knobs a diagnosis needs: the search budget (to make a mesh exhaust
+        // that would not at the default) and partial paths (to see what that mode does). The
+        // corridor cap is deliberately not here — the agent component's corridor buffer is sized
+        // to it at compile time.
+        private int _toolMaxIterations = FPNavMeshPathfinder.MAX_ITERATIONS;
+        private bool _toolPartialPaths = FPNavTuning.Default.PartialPathOnExhaustion;
+        // Needed, not merely convenient: lowering the budget to watch a search run out is exactly
+        // what makes the 0.13 default install a graph, which then removes the exhaustion being
+        // watched. Off here is how partial paths are seen on Field at all.
+        private bool _toolAutoLegs = FPNavTuning.Default.AutoInstallAbstractGraph;
+
+        private FPNavTuning ToolTuningInput => new FPNavTuning(
+            maxIterations: Mathf.Max(1, _toolMaxIterations),
+            partialPathOnExhaustion: _toolPartialPaths,
+            autoInstallAbstractGraph: _toolAutoLegs);
+
+        // Leg-planning tool state. All INPUT: the graph itself lives on the simulator, because the
+        // agent system is what owns it. 16 is the recommended default: measured at 1.17x route
+        // length at worst there, against 1.33x at cell 32.
+        private float _legCellSize = 16f;
+        private FPNavAbstractCostFold _legCostFold = FPNavAbstractCostFold.Min;
+        private PathMask _legGraphMask = PathMask.AgentDefault;
+        private string _legStatus;
 
         // Placement tool state. All of it is INPUT: the geometry lives in the data layer's probe.
         private bool _placeRetain = true;
@@ -331,6 +358,29 @@ namespace xpTURN.Klotho.Editor
 
         #region NavMesh data
 
+        /// <summary>
+        /// Loads, or reloads, the selected asset. Shared with the log toggle, which has to reload
+        /// to mean anything — see the comment there.
+        /// </summary>
+        private void LoadSelectedNavMesh(bool focusCamera)
+        {
+            if (_navMeshAsset == null) return;
+
+            _data.Unload();
+            _agentSim.Reset();
+            // Initialize builds a new agent system, which carries no graph — so the leg controls
+            // must stop claiming one. Without this the window keeps a stale refusal (and, before
+            // the simulator cleared its own handle, stale node counts) about a mesh that is no
+            // longer loaded.
+            _legStatus = null;
+
+            if (!_data.LoadFromBytes(_navMeshAsset.bytes, ToolTuningInput)) return;
+
+            _agentSim.Initialize(_data);
+            if (focusCamera)
+                FocusSceneViewOnNavMesh();   // move SceneView camera to NavMesh center
+        }
+
         private void DrawNavMeshSection()
         {
             _foldoutNavMesh = EditorGUILayout.Foldout(_foldoutNavMesh, "NavMesh Data", true);
@@ -343,29 +393,77 @@ namespace xpTURN.Klotho.Editor
                 "NavMesh File", _navMeshAsset, typeof(TextAsset), false);
 
             if (GUILayout.Button("Load", GUILayout.Width(50)) && _navMeshAsset != null)
-            {
-                _data.Unload();
-                _agentSim.Reset();
-
-                if (_data.LoadFromBytes(_navMeshAsset.bytes))
-                {
-                    _agentSim.Initialize(_data);
-                    // Move SceneView camera to NavMesh center
-                    FocusSceneViewOnNavMesh();
-                }
-            }
+                LoadSelectedNavMesh(focusCamera: true);
 
             if (GUILayout.Button("Unload", GUILayout.Width(60)))
             {
                 _data.Unload();
                 _agentSim.Reset();
+                _legStatus = null;
             }
             EditorGUILayout.EndHorizontal();
+
+            // Always visible, not only before a load. It used to live in the not-loaded branch, so
+            // the one moment you want it — a mesh is open and something is not being reported — was
+            // the one moment it was gone.
+            //
+            // Flipping it RELOADS, and that is not politeness: the query, pathfinder, funnel and
+            // agent system each keep the logger they were constructed with, so setting the flag on
+            // a loaded mesh would change a bool and nothing else. A switch that looks like it
+            // worked and did not is worse than no switch.
+            EditorGUI.BeginChangeCheck();
+            bool enableLogs = EditorGUILayout.ToggleLeft(
+                _data.IsLoaded
+                    ? "enable Logs (reloads the mesh — agents are cleared)"
+                    : "enable Logs",
+                _data.EnableLogs);
+            if (EditorGUI.EndChangeCheck())
+            {
+                _data.EnableLogs = enableLogs;
+                if (_data.IsLoaded)
+                    LoadSelectedNavMesh(focusCamera: false);
+            }
+
+            // Tuning for the NEXT load. Like the log toggle above, applying means reloading: the
+            // query, pathfinder, funnel and agent system each hold the tuning they were built with,
+            // and the agent system refuses a trio that disagrees with it. Without these two knobs
+            // nothing in the editor could make a mesh exhaust its budget or show a partial path —
+            // the whole PARTIAL labelling was unreachable on the default 4096 over any shipped stage.
+            EditorGUILayout.BeginHorizontal();
+            _toolMaxIterations = Mathf.Max(1, EditorGUILayout.IntField(
+                new GUIContent("Search Budget", "FPNavTuning.MaxIterations for the tool's own stack: "
+                    + "triangles one A* may pop. Lower it to make a mesh run out on purpose."),
+                _toolMaxIterations));
+            _toolPartialPaths = EditorGUILayout.ToggleLeft(
+                new GUIContent("partial paths", "FPNavTuning.PartialPathOnExhaustion: a search that "
+                    + "runs out hands back the corridor to the closest point it reached."),
+                _toolPartialPaths, GUILayout.Width(100));
+            _toolAutoLegs = EditorGUILayout.ToggleLeft(
+                new GUIContent("auto legs", "FPNavTuning.AutoInstallAbstractGraph: the agent system "
+                    + "installs an abstract graph itself on a mesh past the search budget. Turn it off "
+                    + "to watch a flat search run out on a large mesh."),
+                _toolAutoLegs, GUILayout.Width(90));
+            EditorGUILayout.EndHorizontal();
+            if (_data.IsLoaded && !_data.ToolTuning.Equals(ToolTuningInput))
+            {
+                EditorGUILayout.HelpBox(
+                    $"Loaded with budget {_data.ToolTuning.MaxIterations}, partial paths "
+                    + $"{(_data.ToolTuning.PartialPathOnExhaustion ? "on" : "off")}, auto legs "
+                    + $"{(_data.ToolTuning.AutoInstallAbstractGraph ? "on" : "off")}. "
+                    + "Reload to apply (agents, placements and the leg graph are cleared).",
+                    MessageType.Info);
+                if (GUILayout.Button("Reload with this tuning"))
+                    LoadSelectedNavMesh(focusCamera: false);
+            }
 
             if (_data.IsLoaded)
             {
                 EditorGUILayout.LabelField("Vertices", _data.NavMesh.Vertices.Length.ToString());
                 EditorGUILayout.LabelField("Triangles", _data.NavMesh.Triangles.Length.ToString());
+                EditorGUILayout.LabelField("Tuning",
+                    $"budget {_data.ToolTuning.MaxIterations}, partial paths "
+                    + $"{(_data.ToolTuning.PartialPathOnExhaustion ? "on" : "off")}, auto legs "
+                    + $"{(_data.ToolTuning.AutoInstallAbstractGraph ? "on" : "off")}");
                 EditorGUILayout.LabelField("Grid",
                     $"{_data.NavMesh.GridWidth} x {_data.NavMesh.GridHeight} (Cell Size: {_data.NavMesh.GridCellSize.ToFloat():F1})");
 
@@ -381,12 +479,18 @@ namespace xpTURN.Klotho.Editor
 
                 EditorGUILayout.LabelField("Boundary Edges", _data.BoundaryEdges.Count.ToString());
                 EditorGUILayout.LabelField("Internal Edges", _data.InternalEdges.Count.ToString());
-            }
-            else
-            {
-                EditorGUILayout.BeginHorizontal();
-                _data.EnableLogs = EditorGUILayout.ToggleLeft("enable Logs", _data.EnableLogs, GUILayout.Width(160));
-                EditorGUILayout.EndHorizontal();
+
+                // Beside the mesh's own numbers, because that is what it is a fact about — and
+                // because the first version of this sat under the leg controls, ten rows into a
+                // section you have to scroll, which is the same as not saying it. Only while legs
+                // are off: with a graph installed the reader has already answered it.
+                if (_agentSim.AbstractGraph == null)
+                {
+                    string risk = _agentSim.DescribeFlatPlanningRisk(out bool canExhaust);
+                    if (!string.IsNullOrEmpty(risk))
+                        EditorGUILayout.HelpBox(
+                            risk, canExhaust ? MessageType.Warning : MessageType.Info);
+                }
             }
 
             EditorGUI.indentLevel--;
@@ -483,6 +587,180 @@ namespace xpTURN.Klotho.Editor
                 EditorGUILayout.LabelField(
                     "   plans through buildings, cannot enter them → walks in and reports Blocked",
                     EditorStyles.miniLabel);
+        }
+
+        /// <summary>
+        /// Planning in legs. Lives INSIDE the agent section on purpose: the abstract graph is a
+        /// property of the agent system, and the Pathfinding section's Find Path goes straight to
+        /// the pathfinder and is unaffected. A switch at the top of the window would read as global
+        /// and then look broken when Find Path ignored it.
+        ///
+        /// <para>Derivation runs on the button, never on the field edits — it is 12.6 ms on the
+        /// Field asset at cell 16 and OnGUI runs every repaint.</para>
+        /// </summary>
+        private void DrawLegPlanningControls()
+        {
+            EditorGUILayout.Space(4);
+            var graph = _agentSim.AbstractGraph;
+            EditorGUILayout.LabelField(
+                graph == null ? "Planning in legs — off"
+                : _agentSim.AbstractGraphIsAutomatic ? "Planning in legs — ON (automatic)"
+                : "Planning in legs — ON",
+                EditorStyles.boldLabel);
+
+            var prevIndent = EditorGUI.indentLevel;
+            EditorGUI.indentLevel = 0;
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("Cell size", GUILayout.Width(70));
+            _legCellSize = EditorGUILayout.FloatField(_legCellSize, GUILayout.Width(50));
+            GUILayout.Label("Cost fold", GUILayout.Width(64));
+            _legCostFold = (FPNavAbstractCostFold)EditorGUILayout.EnumPopup(
+                _legCostFold, GUILayout.Width(70));
+            EditorGUILayout.EndHorizontal();
+
+            // The mask the graph is DERIVED under, which is not decoration: an agent whose resolved
+            // plan mask differs from it falls back to the flat path and is counted. Leaving it at
+            // the agent default is what a game does; flipping it to All areas and matching an
+            // agent's plan mask is the only way to watch that fallback disappear.
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("Derive for", GUILayout.Width(70));
+            _legGraphMask = (PathMask)EditorGUILayout.EnumPopup(_legGraphMask, GUILayout.Width(120));
+            GUILayout.Label(
+                _legGraphMask == PathMask.AllAreas ? "~0" : "~BUILDING_MASK", GUILayout.Width(120));
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("Apply", GUILayout.Width(60)))
+            {
+                _legStatus = _agentSim.TryInstallAbstractGraph(
+                    _legCellSize, _legCostFold, ResolveAgentMask(_legGraphMask), out string reason)
+                    ? null
+                    : reason;
+                SceneView.RepaintAll();
+            }
+            using (new EditorGUI.DisabledScope(graph == null))
+            {
+                if (GUILayout.Button("Clear", GUILayout.Width(60)))
+                {
+                    _agentSim.ClearAbstractGraph();
+                    _legStatus = null;
+                    SceneView.RepaintAll();
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+
+            if (graph != null)
+            {
+                // NodeCount is the number that says whether legs can do anything here at all: one
+                // node means every plan already ends inside it, so the route is the flat one and
+                // that is correct rather than broken.
+                EditorGUILayout.LabelField(
+                    $"   {graph.NodeCount} nodes, {graph.EdgeCount} edges, "
+                    + $"widest node {graph.MaxNodeDiameter} hops → up to "
+                    + $"{graph.MaxLegCorridorTriangles} corridor tris (cap {_agentSim.CorridorCap})",
+                    EditorStyles.miniLabel);
+                EditorGUILayout.LabelField(
+                    $"   checksum 0x{graph.Checksum:X16} — folded into the nav fingerprint",
+                    EditorStyles.miniLabel);
+                if (graph.NodeCount <= 1)
+                    EditorGUILayout.LabelField(
+                        "   one node: every route ends inside it, so legs change nothing here",
+                        EditorStyles.miniLabel);
+                // The answer the abstract-search counter cannot give: more than one piece means
+                // some node pairs genuinely have no route, so that counter rising is the map and
+                // not a defect.
+                EditorGUILayout.LabelField(
+                    graph.NodeComponentCount <= 1
+                        ? "   1 connected piece — every node can reach every other"
+                        : $"   {graph.NodeComponentCount} disconnected pieces — routes between them "
+                          + "do not exist, and 'abstract search failed' will count them",
+                    EditorStyles.miniLabel);
+
+                _overlay.ShowNodes = EditorGUILayout.ToggleLeft(
+                    "Show node partition (colours the triangle fill)", _overlay.ShowNodes);
+                if (_overlay.ShowNodes)
+                    EditorGUILayout.LabelField(
+                        "   node ids are reassigned on every rebake, so placing a building "
+                        + "recolours everything",
+                        EditorStyles.miniLabel);
+            }
+            else
+            {
+                _overlay.ShowNodes = false;
+
+                // One line, because the notice itself is up in NavMesh Data where the triangle
+                // count is. Repeating it here would be the same sentence in two places, and this
+                // block is the one you reach only if you already went looking.
+                string risk = _agentSim.DescribeFlatPlanningRisk(out bool canExhaust);
+                if (!string.IsNullOrEmpty(risk))
+                    EditorGUILayout.LabelField(
+                        canExhaust
+                            ? "   this mesh can exhaust a flat search — see NavMesh Data above"
+                            : "   this mesh can clamp a flat corridor — see NavMesh Data above",
+                        EditorStyles.miniLabel);
+            }
+
+            // The overlay never derives its own graph: a second derivation could disagree with the
+            // one the agents plan against, and the only symptom would be a picture that is wrong.
+            _overlay.AbstractGraph = graph;
+
+            EditorGUI.indentLevel = prevIndent;
+
+            if (!string.IsNullOrEmpty(_legStatus))
+                EditorGUILayout.HelpBox(_legStatus, MessageType.Warning);
+        }
+
+        /// <summary>
+        /// The navigation counters, which nothing in either tool used to show. They are the only
+        /// place the leg planner's own failures are visible: an abstract search that finds no node
+        /// route never reaches the triangle search, so the pathfinder's budget counter stays at zero
+        /// while every unit stands still.
+        ///
+        /// <para>All of them are MONOTONIC — never reset — so they are labelled by what they count
+        /// from rather than sitting next to the tick, which Reset does return to zero.</para>
+        /// </summary>
+        private void DrawNavCounters()
+        {
+            EditorGUILayout.Space(4);
+            _foldoutCounters = EditorGUILayout.Foldout(_foldoutCounters, "Nav counters (since load)", true);
+            if (!_foldoutCounters) return;
+
+            var c = _agentSim.ReadNavCounters();
+            var prevIndent = EditorGUI.indentLevel;
+            EditorGUI.indentLevel = 0;
+
+            EditorGUILayout.LabelField(
+                $"legs advanced {c.legAdvance}    abstract search failed {c.abstractSearchFailed}"
+                + $"    leg unsolvable {c.legResolveFailed}", EditorStyles.miniLabel);
+            // Read as a RATE against "legs advanced" beside it, not as a total. A leg that takes
+            // even one tick to walk never lands here, so this staying near zero is legs working;
+            // it climbing with "legs advanced" means the reach radius (speed^2 / acceleration) has
+            // swallowed a node and every agent re-plans every tick. The runtime says so once, with
+            // both numbers, the first time it happens.
+            EditorGUILayout.LabelField(
+                $"legs that ended on the tick they were planned {c.legEndedOnPlanTick}"
+                + (c.legEndedOnPlanTick > 0 && c.legEndedOnPlanTick >= c.legAdvance
+                    ? "  <-- every leg; the reach radius is wider than a node" : ""),
+                EditorStyles.miniLabel);
+            EditorGUILayout.LabelField(
+                $"mask fallback {c.maskFallback}    corridor copy truncated {c.corridorCopyTruncated}",
+                EditorStyles.miniLabel);
+            // Split out and labelled: these two live on the pathfinder, which the Find Path button
+            // shares with the agents. Pressing that button moves them with no agent involved.
+            EditorGUILayout.LabelField(
+                $"pathfinder (shared with Find Path) — corridor clamped {c.corridorTruncated}"
+                + $"    budget exhausted {c.iterationExhausted}", EditorStyles.miniLabel);
+            // The conjunction, kept apart from the raw budget count above it. That one includes
+            // overruns INSIDE a leg, where the hierarchy is working and the budget is simply small;
+            // this one only counts searches nothing was shortening. A graph being installed does not
+            // zero it — an agent whose plan mask differs from the graph's still plans flat.
+            EditorGUILayout.LabelField(
+                $"exhausted with nothing shortening the search {c.exhaustedWithoutLegs}"
+                + (c.exhaustedWithoutLegs > 0 ? "   <-- legs would make these local" : ""),
+                EditorStyles.miniLabel);
+
+            EditorGUI.indentLevel = prevIndent;
         }
 
         /// <summary>
@@ -725,7 +1003,9 @@ namespace xpTURN.Klotho.Editor
             // Path results
             if (_data.HasPath)
             {
-                EditorGUILayout.LabelField("Status", "Success");
+                EditorGUILayout.LabelField("Status", _data.PathIsPartial
+                    ? "PARTIAL — the budget ran out; the path stops at the closest point reached"
+                    : "Success");
                 EditorGUILayout.LabelField("Corridor", $"{_data.CorridorLength} triangles");
                 EditorGUILayout.LabelField("Waypoints", $"{_data.WaypointCount} points");
 
@@ -839,7 +1119,12 @@ namespace xpTURN.Klotho.Editor
                     // WHY it failed, judged against the mesh as it is now. Separate from the
                     // destination refusal above: that one says "the click was refused", this one
                     // says "the destination it has cannot be reached".
-                    string why = FPNavPathFailure.Describe(rd.failureReason);
+                    // Same sentence the console gets, from the same helper — the list and the log
+                    // must not drift into describing one state two ways.
+                    string why = rd.failureReason == FPNavPathFailureReason.None
+                        ? ""
+                        : " ← " + FPNavMeshAgentSimulator.ExplainFailure(
+                            rd.failureReason, rd.failedKind, _agentSim.PartialPathsOn);
                     string sel = _interaction.SelectedAgentIndex == i ? "▸" : " ";
                     EditorGUILayout.LabelField($"{sel}#{i}: {status}{extra}{masks}{why} {pos}");
 
@@ -859,6 +1144,9 @@ namespace xpTURN.Klotho.Editor
 
                 DrawAgentAreaMaskControls();
             }
+
+            DrawLegPlanningControls();
+            DrawNavCounters();
 
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Remove All"))

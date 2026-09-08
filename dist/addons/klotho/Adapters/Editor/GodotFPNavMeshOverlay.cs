@@ -15,6 +15,20 @@ namespace xpTURN.Klotho.Godot
     {
         // Geometry layer
         public bool ShowTriangles = true;
+
+        /// <summary>
+        /// Colour the triangle fill by abstract node and outline where one node ends. Off by
+        /// default: it replaces the fill that says blocked/building, so it is a lens, not the
+        /// normal view. Mirrors the Unity overlay.
+        /// </summary>
+        public bool ShowNodes;
+
+        /// <summary>
+        /// The graph to colour by, or null. Set by the controller from the simulator — the overlay
+        /// does NOT derive its own: a second derivation could disagree with the one the agents plan
+        /// against, and the only symptom would be a picture that is quietly wrong.
+        /// </summary>
+        public FPNavAbstractGraph AbstractGraph;
         public bool ShowEdges = true;
         public bool ShowBoundaryEdges = true;
         public bool ShowObstacleRings;
@@ -130,6 +144,10 @@ namespace xpTURN.Klotho.Godot
             var fill = new Surf(_staticMesh, Mesh.PrimitiveType.Triangles, _fillMat);
             if (ShowTriangles)
             {
+                // Node colouring is a MODE of this fill, not a pass of its own — see the Unity
+                // overlay for why (the cost heatmap's second full sweep is what not to copy).
+                var graph = ShowNodes ? AbstractGraph : null;
+
                 for (int i = 0; i < _data.CachedTriangles.Length; i++)
                 {
                     ref TriangleRenderData tri = ref _data.CachedTriangles[i];
@@ -137,9 +155,20 @@ namespace xpTURN.Klotho.Godot
                     // Equality, not a bit test — the rebaker stamps a retained footprint
                     // EXCLUSIVELY (see FPNavMeshAreas); isBlocked still wins, being the stronger
                     // claim. Mirrors FPNavMeshSceneOverlay.DrawTriangles.
-                    Color c = tri.isBlocked
-                        ? GodotFPNavMeshVisualizerStyles.TriangleFillBlocked
-                        : tri.areaMask == FPNavMeshAreas.BUILDING_MASK
+                    Color c;
+                    if (tri.isBlocked)
+                        c = GodotFPNavMeshVisualizerStyles.TriangleFillBlocked;
+                    else if (graph != null)
+                    {
+                        // -1 is "no node claims this" — masked out or blocked — and must not share
+                        // a colour with node 0.
+                        int node = graph.NodeOf(i);
+                        c = node < 0
+                            ? GodotFPNavMeshVisualizerStyles.TriangleFillOutsideGraph
+                            : GodotFPNavMeshVisualizerStyles.NodeFill(node);
+                    }
+                    else
+                        c = tri.areaMask == FPNavMeshAreas.BUILDING_MASK
                             ? GodotFPNavMeshVisualizerStyles.TriangleFillBuilding
                             : GodotFPNavMeshVisualizerStyles.TriangleFill;
                     AddTri(fill, c, tri.v0, tri.v1, tri.v2);
@@ -156,6 +185,8 @@ namespace xpTURN.Klotho.Godot
                 for (int i = 0; i < _data.InternalEdges.Count; i++)
                     AddLine(line, c, _data.InternalEdges[i].a, _data.InternalEdges[i].b);
             }
+            if (ShowNodes && AbstractGraph != null)
+                AddNodeBoundaries(line);
             if (ShowBoundaryEdges)
             {
                 var c = GodotFPNavMeshVisualizerStyles.EdgeBoundary;
@@ -220,6 +251,48 @@ namespace xpTURN.Klotho.Godot
             }
             if (ShowGridLabels)
                 CollectGridLabels();
+        }
+
+        /// <summary>
+        /// Where one node ends and the next begins — every mesh edge whose two triangles belong to
+        /// different nodes. That set is EXACTLY the abstract graph's portals (an abstract edge is
+        /// "two triangles that are mesh neighbours in different nodes", no folding, no chosen
+        /// representative), so nothing here approximates what the planner uses. Derived from the
+        /// mesh because the graph exposes one accessor by design and this needs nothing more —
+        /// edge COST is deliberately not reconstructed. Mirrors the Unity overlay.
+        /// </summary>
+        private void AddNodeBoundaries(Surf line)
+        {
+            var mesh = _data.NavMesh;
+            var graph = AbstractGraph;
+
+            for (int t = 0; t < mesh.Triangles.Length; t++)
+            {
+                int a = graph.NodeOf(t);
+                if (a < 0) continue;
+
+                ref readonly FPNavMeshTriangle tri = ref mesh.Triangles[t];
+                for (int e = 0; e < 3; e++)
+                {
+                    int nb = tri.GetNeighbor(e);
+                    // Draw each shared edge between two IN-GRAPH triangles once, from the lower
+                    // index. A RIM edge is exempt: its outer triangle is dropped by the `a < 0`
+                    // continue above, so it is reached from one side only and deduping it dropped
+                    // about half the rim. Mirrors the Unity overlay.
+                    if (nb < 0 || (nb < t && graph.NodeOf(nb) >= 0)) continue;
+
+                    int b = graph.NodeOf(nb);
+                    // b < 0 is the graph's OUTER RIM, not a node boundary — different meaning,
+                    // different colour, or a portal gets drawn where the planner has none.
+                    if (b == a) continue;
+
+                    tri.GetEdgeVertices(e, out int va, out int vb);
+                    AddLine(line,
+                        b < 0 ? GodotFPNavMeshVisualizerStyles.GraphRimLine
+                              : GodotFPNavMeshVisualizerStyles.NodeBoundaryLine,
+                        mesh.Vertices[va].ToVector3(), mesh.Vertices[vb].ToVector3());
+                }
+            }
         }
 
         private void AddCostHeatmap(Surf fill)
@@ -391,6 +464,16 @@ namespace xpTURN.Klotho.Godot
                 _dynamicLabels.Add((rd.position + Vector3.Up * (rd.radius + 0.2f), $"#{i}"));
                 if (rd.hasDestination)
                     AddWireDisc(line, GodotFPNavMeshVisualizerStyles.AgentDestination, rd.destination, 0.15f);
+
+                // Where THIS leg ends, drawn only when it differs from the destination — which is
+                // exactly when a graph is steering. Without it the counters say legs are being
+                // taken and nothing on screen shows where.
+                if (ShowNodes && rd.hasPath && rd.pathTarget != rd.destination)
+                {
+                    var c = GodotFPNavMeshVisualizerStyles.LegTargetMarker;
+                    AddLine(line, c, rd.position, rd.pathTarget);
+                    AddWireDisc(line, c, rd.pathTarget, 0.35f);
+                }
             }
         }
 

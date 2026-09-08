@@ -171,6 +171,7 @@ namespace xpTURN.Klotho.Core
         /// a game that wants to pace slices itself no longer can.</para>
         /// </summary>
         private xpTURN.Klotho.Deterministic.Navigation.FPNavMeshRebakeDriver _navRebakeDriver;
+        private xpTURN.Klotho.Deterministic.Navigation.INavGraphPreparer _navGraphPreparer;
 
         /// <summary>
         /// Finds the driver and takes the heartbeat claim. Called from both <c>Initialize</c> bodies.
@@ -200,7 +201,18 @@ namespace xpTURN.Klotho.Core
 
             _navRebakeDriver = resolved;
             if (_navRebakeDriver == null)
+            {
+                _navGraphPreparer = null;
                 return;
+            }
+
+            // Resolved beside the driver because it is only useful beside the driver: what it
+            // prepares against is the mesh the driver is about to install. Absent on most games —
+            // the seam does nothing unless a navigation system installs an abstract graph — and
+            // absent is silent, unlike the fingerprint sources below, because nothing is lost when
+            // it is missing. A swap just pays for the derivation on the tick, as it always did.
+            _navGraphPreparer = (_simulation as xpTURN.Klotho.ECS.EcsSimulation)
+                ?.GetSystem<xpTURN.Klotho.Deterministic.Navigation.INavGraphPreparer>();
 
             _navRebakeDriver.TryClaimSliceHeartbeat();
             _logger?.KInformation(
@@ -1383,6 +1395,15 @@ namespace xpTURN.Klotho.Core
             // — if something does it is a defect in that containment, and swallowing it a second time
             // would hide the one path that is supposed to be exception-free.
             _navRebakeDriver?.AdvanceSlice(deltaTime);
+
+            // And, on the same frame boundary, build whatever that mesh will make the navigation
+            // system rebuild — for the same reason the line above is here rather than in the game:
+            // work that must happen when a mesh goes live but need not happen ON the tick. Missing
+            // it is invisible (a tick merely costs more), which is exactly why it is not left to a
+            // game to remember. Null mesh, live mesh and the same mesh many frames running are all
+            // no-ops, so this is unconditional on purpose.
+            if (_navGraphPreparer != null && _navRebakeDriver != null)
+                _navGraphPreparer.PrepareAbstractGraphFor(_navRebakeDriver.PeekPreparedMesh);
 
             // Drop last frame's rollback deltas. Same placement rule as the calls above — once per Update,
             // ahead of every per-mode early return — and here that rule is load-bearing rather than tidy:

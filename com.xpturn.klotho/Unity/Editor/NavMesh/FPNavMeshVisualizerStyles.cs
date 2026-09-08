@@ -65,5 +65,31 @@ namespace xpTURN.Klotho.Editor
         public static readonly Color GridCellLabel = new Color(1.0f, 1.0f, 1.0f, 0.6f);
 
         public const float GridLineWidth = 1.0f;
+
+        // Abstract graph (planning in legs)
+        public static readonly Color TriangleFillOutsideGraph = new Color(0.35f, 0.35f, 0.35f, 0.18f);
+        public static readonly Color NodeBoundaryLine = new Color(1.0f, 1.0f, 1.0f, 0.75f);
+        public static readonly Color GraphRimLine = new Color(0.35f, 0.35f, 0.35f, 0.5f);
+        public static readonly Color LegTargetMarker = new Color(0.2f, 1.0f, 0.6f, 0.95f);
+
+        public const float NodeBoundaryLineWidth = 2.0f;
+        public const float LegTargetMarkerSize = 0.35f;
+
+        /// <summary>
+        /// A colour for a node id. Golden-ratio hue rotation, so ids that are near each other — and
+        /// node ids ARE handed out in triangle order, which makes neighbours adjacent numbers — land
+        /// far apart on the wheel and the partition reads as distinct regions.
+        ///
+        /// <para>Node ids are not stable across a rebake: they are reassigned in triangle order
+        /// every derivation, so every colour changes when a building is placed. That is the ids
+        /// being what they are, not the palette being unstable.</para>
+        /// </summary>
+        public static Color NodeFill(int node)
+        {
+            float hue = (node * 0.61803399f) % 1f;
+            Color c = Color.HSVToRGB(hue, 0.55f, 0.95f);
+            c.a = 0.30f;
+            return c;
+        }
     }
 }

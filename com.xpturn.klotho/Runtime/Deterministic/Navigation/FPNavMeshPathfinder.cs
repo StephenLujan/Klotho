@@ -48,6 +48,21 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         private int _blockedEndpointCount;
         private int _areaMaskRejectedCount;
         private int _maskedStartCount;
+        private int _partialPathCount;
+        private int _partialRejectedCount;
+
+        // Per-call: what the most recent FindPath handed back (see DebugLastPathWasPartial).
+        private bool _lastPartial;
+
+        // The node that got closest to the goal during the current search, by the heuristic the
+        // search itself computes at push time (Detour's m_lastBestNode). Ties break toward the lower
+        // triangle index. This is deterministic — same mesh, same endpoints, same answer on every
+        // peer — but it is not a pure function of the mesh: the heuristic is taken at the node's
+        // ENTRY edge, and a later, cheaper visit through a different edge moves that entry point
+        // without raising _bestH, so a node can stay best on the strength of an edge it no longer
+        // enters by. TryPartialPath re-measures the winner at its centre before trusting it.
+        private int _bestNode;
+        private FP64 _bestH;
 
         /// <summary>
         /// Diagnostic: paths whose triangle chain was longer than <see cref="MAX_CORRIDOR"/> and
@@ -64,6 +79,32 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// opposed to "there is genuinely no route". Accumulated over this instance's lifetime.
         /// </summary>
         public int DebugIterationExhaustedCount => _iterationExhaustedCount;
+
+        private int _lastSearchIterations;
+
+        /// <summary>
+        /// Triangles the MOST RECENT <c>FindPath</c> CALL popped, against
+        /// <see cref="FPNavTuning.MaxIterations"/>. <b>Zero when that call did not search</b> — an
+        /// endpoint off the mesh, a blocked or masked endpoint, or a start and end in the same
+        /// triangle all return before A* begins, and zero is what those spent.
+        ///
+        /// <para><b>It belongs to a CALL, not to an agent.</b> There is one of these per
+        /// pathfinder, and a whole tick of agents shares one pathfinder — as does the visualizer's
+        /// Find Path button. After <c>FPNavAgentSystem.Update</c> this holds whatever the last
+        /// agent to plan spent, and that agent need not be one that failed. Anything reading it
+        /// per agent is claiming an attribution that does not exist here.</para>
+        ///
+        /// <para><b>Not monotonic, unlike every other counter here</b> — it is overwritten by each
+        /// call, so it means something only when read immediately after one. It exists because
+        /// "the budget ran out" is not by itself actionable: the budget is spent in TRIANGLES, so
+        /// whether 4096 is a lot depends entirely on how finely the mesh is cut. A tool that can say
+        /// "4096 of 4096 popped to cover 22 units" turns a bare failure into a diagnosis — the
+        /// direct line must be blocked, because an open 22 units would never cost that many.</para>
+        ///
+        /// <para>Diagnostic only: written during the search, read by tools, and never an input to
+        /// one. It does not reach the hash, the wire, or a replay.</para>
+        /// </summary>
+        public int DebugLastSearchIterations => _lastSearchIterations;
 
         /// <summary>
         /// Diagnostic: calls rejected because the start or end triangle is flagged
@@ -97,6 +138,32 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// and replay, never reset, and a resimulated tick counts again.</para>
         /// </summary>
         public int DebugMaskedStartCount => _maskedStartCount;
+
+        /// <summary>
+        /// Diagnostic: searches that ran out of budget and returned a <b>partial</b> corridor — the
+        /// chain to the node that got closest to the goal — because
+        /// <see cref="FPNavTuning.PartialPathOnExhaustion"/> is on and that node made progress.
+        /// Every one of these also counts in <see cref="DebugIterationExhaustedCount"/>: the budget
+        /// did run out; what changed is what the caller got. Same conventions as the other counters.
+        /// </summary>
+        public int DebugPartialPathCount => _partialPathCount;
+
+        /// <summary>
+        /// Diagnostic: searches that ran out of budget with partial paths ON and still returned
+        /// <c>false</c>, because the closest node was no closer than the start by the caller's
+        /// minimum. This is the "no progress" half of exhaustion — a unit standing in a pocket that
+        /// faces the goal — and the only way a partial-path search fails other than "no route".
+        /// </summary>
+        public int DebugPartialRejectedCount => _partialRejectedCount;
+
+        /// <summary>
+        /// Whether the MOST RECENT <c>FindPath</c> call returned a partial corridor. Per call, not
+        /// per agent, like <see cref="DebugLastSearchIterations"/>: read it immediately after the
+        /// call whose result you are labelling. A caller of the five-argument overload reads this to
+        /// say that the path stops short of the goal; a caller that also needs WHERE it stops uses
+        /// the eight-argument overload, whose <c>partialEnd</c> is the only source of that point.
+        /// </summary>
+        public bool DebugLastPathWasPartial => _lastPartial;
 
         private readonly FPNavTuning _tuning;
 
@@ -170,11 +237,72 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// <param name="corridor">Resulting corridor array. Warning: this is a reference to the internal buffer and is overwritten on the next FindPath call. Consume it immediately or copy it.</param>
         /// <param name="corridorLength">Corridor length</param>
         /// <returns>Whether a path was found</returns>
+        /// <remarks>
+        /// With <see cref="FPNavTuning.PartialPathOnExhaustion"/> on, <c>true</c> may also mean a
+        /// PARTIAL corridor — one that stops at the node that got closest to the goal before the
+        /// budget ran out. This overload accepts any strictly positive progress; callers that need
+        /// to know, or that want a minimum, use the eight-argument overload, and tools that only
+        /// draw read <see cref="DebugLastPathWasPartial"/> right after the call.
+        /// </remarks>
         public bool FindPath(FPVector3 start, FPVector3 end, int areaMask,
             out int[] corridor, out int corridorLength)
+            => FindPath(start, end, areaMask, FP64.Zero, out corridor, out corridorLength, out _, out _);
+
+        /// <summary>
+        /// <see cref="FindPath(FPVector3, FPVector3, int, out int[], out int)"/>, reporting whether
+        /// the corridor is partial and where it ends.
+        ///
+        /// <para><b>A partial corridor is a corridor to the node that got closest to the goal</b>
+        /// (by the search's own heuristic, ties to the lower triangle index) when the iteration
+        /// budget ran out with work still queued. It is handed back only when that node is closer
+        /// to the goal than the start by MORE than <paramref name="partialMinProgress"/> — measured
+        /// at the node's centre, after the search, so a stale heuristic cannot vouch for it. A
+        /// caller walking an agent passes the agent's reach radius here, which is what makes the
+        /// re-plan at the corridor's end start from somewhere new; a tool passes zero.</para>
+        ///
+        /// <para><b>The corridor is clamped like any other</b> (agent side kept), so
+        /// <paramref name="partialEnd"/> is the centre of the corridor's LAST triangle — the point
+        /// the agent will actually walk to — which is the best node only when the chain fit. The
+        /// progress test is on the best node regardless: measured over the shipped assets, judging
+        /// the clipped end instead refused every winding route (a serpentine's clipped end lies
+        /// further from the goal than its start), and judging the best node reached the goal in
+        /// every one of those with no cycle in 541 chains.</para>
+        ///
+        /// <para><b>When the chain is clipped, the corridor ends at the triangle of the kept prefix
+        /// that lies FARTHEST from the start</b>, not at the cap. The best node is always outside
+        /// the caller's reach radius (its progress is at least that radius, and progress cannot
+        /// exceed distance), but a cap cut at a fixed count can land anywhere along a chain that
+        /// doubles back — on a switchback it landed straight across the wall from the agent, inside
+        /// the radius at full speed, so the hand-off fired on the tick the plan was made and the
+        /// cleared cooldown planned again the next tick, a full budget per tick until the agent's
+        /// own motion carried the end away. Cutting at the farthest point of the prefix keeps a
+        /// valid corridor (a prefix of a valid chain), drops exactly the part that came back, and on
+        /// a switchback puts the end at the turn. Unclipped partials are untouched.</para>
+        ///
+        /// <para><b>A goal already in the open set when the budget runs out is a whole path</b>, not
+        /// a partial: the chain behind it is real, only not yet proven shortest. The exhaustion is
+        /// still counted. Without this the best-node rule handed back a partial to the triangle
+        /// beside the goal (its entry edge is usually nearer the goal point than the goal triangle's
+        /// own) and the agent spent one more hop and one more full-budget search to finish.</para>
+        ///
+        /// <para>Graph exhaustion (open set drained) is still <c>false</c>: "there is no route" keeps
+        /// its answer. Everything that returns before the search starts is unchanged too, and so is
+        /// everything with the switch off.</para>
+        /// </summary>
+        public bool FindPath(FPVector3 start, FPVector3 end, int areaMask, FP64 partialMinProgress,
+            out int[] corridor, out int corridorLength, out bool partial, out FPVector3 partialEnd)
         {
             corridor = _corridor;
             corridorLength = 0;
+            partial = false;
+            partialEnd = default;
+            _lastPartial = false;
+            // Cleared per CALL, not per search. Four of the returns below leave without searching,
+            // and leaving the field alone there let a tool print an older, unrelated search as this
+            // failure's evidence. Zero is what actually happened: no triangle was popped.
+            // Writing it here rather than at each early return is the same behaviour — every path
+            // out either returns before the loop or writes the real count on the way out.
+            _lastSearchIterations = 0;
 
             // Triangle lookup that considers Y height. The END breaks height ties toward ground
             // this query may use: a snapped destination sits on a triangle EDGE, which belongs to
@@ -242,12 +370,15 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             // A* initialization
             Reset();
 
+            FPVector2 endXZ = end.ToXZ();
             TouchNode(startTri);
             _entryPoints[startTri] = start.ToXZ();
-            FP64 h = FPVector2.Distance(start.ToXZ(), end.ToXZ());
+            FP64 h = FPVector2.Distance(start.ToXZ(), endXZ);
             _gScores[startTri] = FP64.Zero;
             _cameFrom[startTri] = -1;
             _openSet.Push(startTri, h);
+            _bestNode = startTri;
+            _bestH = h;
 
             int iterations = 0;
 
@@ -258,6 +389,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
 
                 if (current == endTri)
                 {
+                    _lastSearchIterations = iterations;
                     corridorLength = ReconstructCorridor(current);
                     return corridorLength > 0;
                 }
@@ -308,8 +440,10 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                             _gScores[neighbor] = tentativeG;
                             _cameFrom[neighbor] = current;
                             _entryPoints[neighbor] = edgeMid;
-                            FP64 f = tentativeG + FPVector2.Distance(edgeMid, end.ToXZ());
+                            FP64 hN = FPVector2.Distance(edgeMid, endXZ);
+                            FP64 f = tentativeG + hN;
                             _openSet.DecreaseKey(neighbor, f);
+                            TrackBest(neighbor, hN);
                         }
                     }
                     else
@@ -317,8 +451,10 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                         _gScores[neighbor] = tentativeG;
                         _cameFrom[neighbor] = current;
                         _entryPoints[neighbor] = edgeMid;
-                        FP64 f = tentativeG + FPVector2.Distance(edgeMid, end.ToXZ());
+                        FP64 hN = FPVector2.Distance(edgeMid, endXZ);
+                        FP64 f = tentativeG + hN;
                         _openSet.Push(neighbor, f);
+                        TrackBest(neighbor, hN);
                     }
                 }
             }
@@ -327,10 +463,125 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             // not the iteration count: a search whose last pop empties the set on exactly the
             // MAX_ITERATIONS-th iteration completed its work and found nothing, and counting that
             // as a truncation would report a budget problem that does not exist.
-            if (_openSet.Count > 0)
-                _iterationExhaustedCount++;
+            _lastSearchIterations = iterations;
+            if (_openSet.Count == 0)
+                return false;
 
-            return false;
+            _iterationExhaustedCount++;
+            if (!_tuning.PartialPathOnExhaustion)
+                return false;
+
+            // The goal was reached but not yet popped: the budget ran out inside the window between
+            // the push that discovered it and the pop that would have finished (about ten pops on
+            // the shipped Field asset, one on a switchback). The chain behind it is a real path —
+            // every cameFrom edge was an expansion — just not yet proven shortest, which a partial
+            // never is either. Hand it back whole rather than as a partial to the triangle beside
+            // it, which is what the best-node rule would do: the goal's heuristic is measured at its
+            // entry edge, and a neighbour's edge midpoint is usually nearer the goal point than
+            // that, so the goal itself was the best node in only one such search in six. The
+            // exhaustion stays counted — the budget did run out. Under the switch only: with it off
+            // this search answered false before this change, and turning that into a path would
+            // move the frame hash without a NAV_BEHAVIOUR_REVISION bump.
+            if (_openSet.Contains(endTri))
+            {
+                corridorLength = ReconstructCorridor(endTri);
+                return corridorLength > 0;
+            }
+
+            return TryPartialPath(startTri, start.ToXZ(), endXZ, partialMinProgress,
+                out corridorLength, out partial, out partialEnd);
+        }
+
+        /// <summary>
+        /// Push-time tracking of the node closest to the goal, using the heuristic the search has
+        /// just computed for it — no extra work on the hot path. Strictly smaller wins; an equal
+        /// value wins only with a smaller index, so a TIE does not depend on the order the heap
+        /// happened to expand in. The value itself still can: <c>_bestH</c> only ever falls, so a
+        /// node re-parented through a farther edge (DecreaseKey moves its entry point) keeps the
+        /// smaller heuristic it was first pushed with. Deterministic, and at worst a partial end
+        /// that is not the closest available — the golden tests pin the result as it is.
+        /// </summary>
+        private void TrackBest(int node, FP64 h)
+        {
+            if (h < _bestH || (h == _bestH && node < _bestNode))
+            {
+                _bestH = h;
+                _bestNode = node;
+            }
+        }
+
+        /// <summary>
+        /// The exhausted-with-partials-on tail of <c>FindPath</c>. Judges the BEST node's progress
+        /// (re-measured at its centre — the tracked heuristic was taken at an entry point that a
+        /// later, cheaper visit may have moved), then hands back the clamped chain to it.
+        /// </summary>
+        private bool TryPartialPath(int startTri, FPVector2 startXZ, FPVector2 endXZ, FP64 minProgress,
+            out int corridorLength, out bool partial, out FPVector3 partialEnd)
+        {
+            corridorLength = 0;
+            partial = false;
+            partialEnd = default;
+
+            int best = _bestNode;
+            if (best == startTri)
+            {
+                _partialRejectedCount++;
+                return false;
+            }
+
+            FP64 progress = FPVector2.Distance(startXZ, endXZ)
+                - FPVector2.Distance(_navMesh.Triangles[best].centerXZ, endXZ);
+            if (progress <= FP64.Zero || progress < minProgress)
+            {
+                _partialRejectedCount++;
+                return false;
+            }
+
+            corridorLength = ReconstructCorridor(best);
+            if (corridorLength == 0)
+            {
+                // A malformed cameFrom chain; ReconstructCorridor's own guard tripped.
+                _partialRejectedCount++;
+                return false;
+            }
+
+            // Clipped (the chain did not reach the best node): end at the prefix's farthest
+            // triangle from the start rather than at the cap. See the FindPath remarks — a cut at
+            // a fixed count can land where a doubled-back chain passes the agent again, inside the
+            // reach radius, and that is a hand-off on the plan tick. Strictly farther wins, so an
+            // equal distance keeps the earlier triangle; index 0 is the start's own triangle and is
+            // never chosen over a later one, so a clipped corridor is always at least two long.
+            if (_corridor[corridorLength - 1] != best)
+            {
+                int farthest = 0;
+                FP64 farthestDist = FP64.Zero;
+                for (int i = 0; i < corridorLength; i++)
+                {
+                    FP64 d = FPVector2.Distance(startXZ, _navMesh.Triangles[_corridor[i]].centerXZ);
+                    if (d > farthestDist)
+                    {
+                        farthestDist = d;
+                        farthest = i;
+                    }
+                }
+                if (farthest > 0)
+                    corridorLength = farthest + 1;
+            }
+
+            partialEnd = TriangleCentre(_corridor[corridorLength - 1]);
+            partial = true;
+            _lastPartial = true;
+            _partialPathCount++;
+            return true;
+        }
+
+        /// <summary>The triangle's centre in 3D: the baked XZ centre at the mean height of its vertices.</summary>
+        private FPVector3 TriangleCentre(int tri)
+        {
+            ref readonly FPNavMeshTriangle t = ref _navMesh.Triangles[tri];
+            FP64 y = (_navMesh.Vertices[t.v0].y + _navMesh.Vertices[t.v1].y + _navMesh.Vertices[t.v2].y)
+                / FP64.FromInt(3);
+            return new FPVector3(t.centerXZ.x, y, t.centerXZ.y);
         }
 
         private void Reset()

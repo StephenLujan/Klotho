@@ -197,10 +197,18 @@ namespace xpTURN.Klotho.Godot
             if (bytes == null || bytes.Length == 0) { GD.PushError($"[GodotFPNavMeshVisualizer] Empty file: {resPath}"); return; }
 
             _agentSim.ClearAllAgents();
-            if (_data.LoadFromBytes(bytes))
+            // Initialize builds a new agent system, which carries no graph — so the leg controls
+            // must stop claiming one. Without this the dock keeps a stale refusal about a mesh
+            // that is no longer loaded.
+            LegStatus = null;
+            if (_data.LoadFromBytes(bytes, ToolTuningInput))
             {
+                _loadedPath = resPath;
                 _agentSim.Initialize(_data);
                 TryAttachOverlay();
+                // The constructor may have installed a graph (0.13 default on a large mesh): show it
+                // now, not after the first Apply or Clear.
+                PushGraphToOverlay();
                 _overlay.RebuildStatic();
                 _overlay.RebuildDynamic();
                 _plugin.UpdateOverlays();
@@ -212,6 +220,7 @@ namespace xpTURN.Klotho.Godot
         {
             _data.Unload();
             _agentSim.ClearAllAgents();
+            LegStatus = null;
             _overlay.RebuildStatic();
             _overlay.RebuildDynamic();
             _plugin.UpdateOverlays();
@@ -245,6 +254,28 @@ namespace xpTURN.Klotho.Godot
         /// on one mesh is the point of the tool.
         /// </summary>
         internal bool PathMaskAllAreas;
+
+        // Tool tuning INPUT for the next load — see FPNavMeshVisualizerData.ToolTuning (Unity) for
+        // why it rides the load. The loaded value is _data.ToolTuning. Only the search budget and
+        // the partial-path switch; the corridor cap is not a knob (the agent component's corridor
+        // buffer is sized to it at compile time).
+        internal int ToolMaxIterations = FPNavMeshPathfinder.MAX_ITERATIONS;
+        internal bool ToolPartialPaths = FPNavTuning.Default.PartialPathOnExhaustion;
+        // Needed, not merely convenient: lowering the budget to watch a search run out is exactly
+        // what makes the 0.13 default install a graph, which then removes the exhaustion being watched.
+        internal bool ToolAutoLegs = FPNavTuning.Default.AutoInstallAbstractGraph;
+
+        internal FPNavTuning ToolTuningInput => new FPNavTuning(
+            maxIterations: System.Math.Max(1, ToolMaxIterations),
+            partialPathOnExhaustion: ToolPartialPaths,
+            autoInstallAbstractGraph: ToolAutoLegs);
+
+        /// <summary>Reloads the current file with the tuning input — "apply" for the two knobs.</summary>
+        internal void ReloadWithTuning()
+        {
+            if (!string.IsNullOrEmpty(_loadedPath)) Load(_loadedPath);
+        }
+        private string _loadedPath;
 
         internal int ResolvePathMask() =>
             PathMaskAllAreas ? FPNavMeshAreas.ALL_AREAS : FPNavAgentSystem.DEFAULT_AREA_MASK;
@@ -280,6 +311,53 @@ namespace xpTURN.Klotho.Godot
 
             _agentSim.SetAgentAreaMask(sel,
                 ResolveAgentMask(AgentPlanMaskAllAreas), ResolveAgentMask(AgentWalkMaskAllAreas));
+            RequestDynamicRedraw();
+        }
+
+        // ---- planning in legs (input only; the graph lives on the simulator) ----
+
+        // 16 is the recommended default: measured at 1.17x route length at worst there against
+        // 1.33x at 32.
+        internal float LegCellSize = 16f;
+        internal FPNavAbstractCostFold LegCostFold = FPNavAbstractCostFold.Min;
+
+        /// <summary>
+        /// The mask the graph is DERIVED under — not decoration. An agent whose resolved plan mask
+        /// differs from it falls back to the flat path and is counted; matching them by hand is the
+        /// only way to watch that fallback disappear.
+        /// </summary>
+        internal bool LegGraphMaskAllAreas;
+        internal string LegStatus;
+
+        internal void ApplyAbstractGraph()
+        {
+            LegStatus = _agentSim.TryInstallAbstractGraph(
+                LegCellSize, LegCostFold, ResolveAgentMask(LegGraphMaskAllAreas), out string reason)
+                ? null
+                : reason;
+            PushGraphToOverlay();
+            _dock.Refresh();
+        }
+
+        internal void ClearAbstractGraph()
+        {
+            _agentSim.ClearAbstractGraph();
+            LegStatus = null;
+            PushGraphToOverlay();
+            _dock.Refresh();
+        }
+
+        /// <summary>
+        /// Hands the overlay the graph the AGENTS plan against — it never derives its own, because a
+        /// second derivation could disagree and the only symptom would be a picture that is wrong.
+        /// The static surface carries the node fill, so it has to be rebuilt, not just redrawn.
+        /// </summary>
+        private void PushGraphToOverlay()
+        {
+            _overlay.AbstractGraph = _agentSim?.AbstractGraph;
+            if (_overlay.AbstractGraph == null)
+                _overlay.ShowNodes = false;
+            RequestStaticRedraw();
             RequestDynamicRedraw();
         }
 

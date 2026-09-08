@@ -261,6 +261,67 @@ namespace xpTURN.Klotho.Runtime.Tests.Core
                 "the engine announced self-wiring with no driver registered");
         }
 
+        // ────────────────────────────────── b1b · preparing what the mesh will need
+
+        /// <summary>Records what the engine hands it, and when.</summary>
+        private sealed class RecordingPreparer : INavGraphPreparer
+        {
+            public readonly List<FPNavMesh> Calls = new List<FPNavMesh>();
+            public int NonNullCalls;
+            public void PrepareAbstractGraphFor(FPNavMesh mesh)
+            {
+                Calls.Add(mesh);
+                if (mesh != null) NonNullCalls++;
+            }
+        }
+
+        /// <summary>
+        /// The heartbeat that paces slices also prepares against what those slices produced. The
+        /// pairing is the point: a game cannot be asked to remember this, because forgetting it is
+        /// INVISIBLE — nothing breaks, a tick merely costs ten milliseconds more.
+        /// </summary>
+        [Test]
+        public void EnginePreparesAgainstTheMeshTheDriverIsAboutToInstall()
+        {
+            FPNavMeshRebakeDriver driver = DriverWithPendingTask(out _);
+            var preparer = new RecordingPreparer();
+            (KlothoEngine engine, _, _) = NewEngineWith(driver, preparer);
+
+            // Drive frames until the sliced task finishes and the driver is holding a mesh.
+            for (int i = 0; i < 24 && preparer.NonNullCalls == 0; i++)
+                engine.Update(0.016f);
+
+            Assert.Greater(preparer.Calls.Count, 0, "the engine never asked at all");
+            Assert.Greater(preparer.NonNullCalls, 0,
+                "the driver finished a task and the engine still handed nothing over — "
+                + "PeekPreparedMesh and the pump have drifted apart");
+            Assert.AreSame(driver.PeekPreparedMesh, preparer.Calls[preparer.Calls.Count - 1],
+                "it must be THAT mesh, not some other one: adoption is by reference");
+        }
+
+        [Test]
+        public void WithNoPreparerRegistered_TheHeartbeatIsUnchanged()
+        {
+            FPNavMeshRebakeDriver driver = DriverWithPendingTask(out _);
+            (KlothoEngine engine, _, _) = NewEngine(driver);
+
+            Assert.DoesNotThrow(() => engine.Update(0.016f),
+                "most games install no abstract graph; the seam must cost them a null check");
+        }
+
+        [Test]
+        public void WithNoDriver_ThePreparerIsNeverAsked()
+        {
+            var preparer = new RecordingPreparer();
+            (KlothoEngine engine, _, _) = NewEngineWith(preparer);
+
+            engine.Update(0.016f);
+
+            Assert.AreEqual(0, preparer.Calls.Count,
+                "with nothing rebaking there is no coming mesh to prepare against, and asking would "
+                + "hand it null every frame for the life of the match");
+        }
+
         // ─────────────────────────────────────────────── b2 · the claim
 
         [Test]

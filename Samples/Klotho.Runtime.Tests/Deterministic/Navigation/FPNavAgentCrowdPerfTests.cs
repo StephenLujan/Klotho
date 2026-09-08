@@ -85,16 +85,21 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             public EntityRef[] Entities;
             public EntityRef[][] Clusters;   // the same agents, partitioned into <= MAX_AGENTS runs
             public FPNavMeshPathfinder Pathfinder;
+            public FPNavMesh Mesh;
         }
 
         /// <summary>
         /// N agents on one mesh, already Moving with a live corridor — the steady state, not the
         /// order tick. <paramref name="avoidance"/> off isolates path following from ORCA.
         /// </summary>
-        private static Crowd BuildCrowd(int count, bool avoidance)
+        private static Crowd BuildCrowd(int count, bool avoidance, double abstractCell = 0)
         {
             var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
             var system = NavAgentTestHelper.CreateSystem(mesh, null, out var pathfinder);
+            if (abstractCell > 0)
+                system.SetAbstractGraph(new FPNavAbstractGraph(
+                    mesh, FP64.FromDouble(abstractCell), FPNavAbstractCostFold.Min,
+                    FPNavAgentSystem.DEFAULT_AREA_MASK));
             if (avoidance)
                 system.SetAvoidance(new FPNavAvoidance());
 
@@ -129,6 +134,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 Entities = entities,
                 Clusters = Partition(entities, count, FPNavAgentSystem.MAX_AGENTS),
                 Pathfinder = pathfinder,
+                Mesh = mesh,
             };
         }
 
@@ -246,6 +252,202 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 Report("  (4) Frame.CopyFrom", copy, $"{n + 16} entity slots reserved");
             }
         }
+
+        #region The measurement that decided whether planning in legs was worth building
+
+        /// <summary>
+        /// PG · V-3 — the order tick, legs off against legs on, on the same field the baseline was
+        /// measured on. This is the number the whole plan exists for: 800 units receiving one move
+        /// order cost ~965 ms flat, and ~42% of those searches came back with no path at all.
+        /// </summary>
+        [Test]
+        public void PG_TheOrderTick_LegsOffVersusOn()
+        {
+            TestContext.Out.WriteLine("=== PG · V-3 — order tick, flat vs legs ===");
+            TestContext.Out.WriteLine($"field {FIELD_CELLS}x{FIELD_CELLS} cells, {800} agents on a {AGENT_STRIDE} lattice");
+            TestContext.Out.WriteLine("");
+
+            foreach (double cell in new[] { 0.0, 8.0, 16.0, 32.0 })
+            {
+                const int n = 800;
+                var crowd = BuildCrowd(n, avoidance: true, abstractCell: cell);
+                FPVector3 target = NavAgentTestHelper.CellCenter(2, FIELD_CELLS - 2);
+                int tick = 100;
+                const int cooldown = 11;
+
+                var cost = Measure(() =>
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        ref var nav = ref crowd.Frame.Get<NavAgentComponent>(crowd.Entities[i]);
+                        NavAgentComponent.SetDestination(ref nav, target);
+                    }
+                    crowd.System.Update(ref crowd.Frame, crowd.Entities, n, tick, NavAgentTestHelper.DT);
+                    tick += cooldown;
+                }, warmup: 4, iterations: 5);
+
+                int failed = 0;
+                for (int i = 0; i < n; i++)
+                    if (crowd.Frame.GetReadOnly<NavAgentComponent>(crowd.Entities[i]).Status
+                        == (byte)FPNavAgentStatus.PathFailed) failed++;
+
+                Report(cell == 0 ? "  legs OFF (flat)" : $"  legs ON  cell {cell,4:F0}", cost,
+                    $"{failed,4}/{n} PathFailed | exhausted {crowd.Pathfinder.DebugIterationExhaustedCount,6}, " +
+                    $"clamped {crowd.Pathfinder.DebugCorridorTruncatedCount,6}, " +
+                    $"abstract-fail {crowd.System.DebugAbstractSearchFailedCount,5}, " +
+                    $"leg-fail {crowd.System.DebugLegResolveFailedCount,4}");
+            }
+        }
+
+        /// <summary>
+        /// PG · V-4 and V-11 — what the units actually do. A single agent walks the field with legs
+        /// off and on; the distance it covers answers the optimality question (a hierarchical route
+        /// is not optimal, and a route that visibly detours fails regardless of planning cost), and
+        /// the tick count answers whether anything stalls at a portal.
+        /// </summary>
+        [Test]
+        public void PG_WhatTheUnitDoes_DistanceAndTravelTime()
+        {
+            TestContext.Out.WriteLine("=== PG · V-4 / V-11 — one unit crossing the field ===");
+            TestContext.Out.WriteLine("");
+
+            foreach (int span in new[] { 12, 32, 64, 90 })
+            {
+                FPVector3 start = NavAgentTestHelper.CellCenter(2, 2);
+                FPVector3 goal = NavAgentTestHelper.CellCenter(span, span);
+                FP64 straight = FPVector2.Distance(start.ToXZ(), goal.ToXZ());
+
+                TestContext.Out.WriteLine(
+                    $"--- {span}x{span} cells apart (straight line {straight.ToDouble():F1}) ---");
+
+                foreach (double cell in new[] { 0.0, 16.0, 32.0 })
+                {
+                    var r = WalkOne(start, goal, cell);
+                    TestContext.Out.WriteLine(
+                        $"  {(cell == 0 ? "flat   " : $"cell {cell,4:F0}")}  " +
+                        $"{r.status,-11} {r.ticks,5} ticks, travelled {r.distance,8:F1}" +
+                        (r.status == "Arrived"
+                            ? $"  ratio {r.distance / straight.ToDouble(),5:F2}x straight, {r.legs,3} legs"
+                            : ""));
+                }
+                TestContext.Out.WriteLine("");
+            }
+        }
+
+        /// <summary>
+        /// V-P0 — the ratio off the diagonal. PG measured four routes and all four were exactly
+        /// 45 degrees, which is the one angle where committing to portal midpoints costs nothing:
+        /// on a square lattice a 45-degree route steps through node centres and the midpoints of
+        /// the edges it crosses all land on the same diagonal, so the "zigzag" is a straight line.
+        ///
+        /// <para>That is why 1.17x passed while a user watching the visualizer sees V-shaped
+        /// detours. This walks the same field at roughly 27 degrees (2 east per 1 north) at three
+        /// distances, because the question is not "is the ratio bad" but "does it stay bad as the
+        /// route gets longer". At 45 degrees the detour was a constant 14.4 units — one bad first
+        /// leg — so the ratio improved with distance (1.17x at 85, 1.03x at 249).</para>
+        ///
+        /// <para><b>Prediction, written before running.</b> If midpoint commitment is what bends the
+        /// route, a 2-east-1-north staircase pays 16 + 8*sqrt(2) + 8*sqrt(2) = 38.6 per period
+        /// against a straight 35.8, so the ratio should sit near <b>1.08x and stay there at every
+        /// distance</b>. A ratio that instead improves with distance says the midpoints are not the
+        /// problem and cause (1) is confined to irregular triangulations — which would move this
+        /// plan's whole first half.</para>
+        /// </summary>
+        [Test]
+        public void VP0_TheRatioOffTheDiagonal()
+        {
+            TestContext.Out.WriteLine("=== V-P0 — ratio off the 45-degree diagonal (~27 degrees) ===");
+            TestContext.Out.WriteLine(
+                "prediction: ~1.08x, CONSTANT across distance, if midpoint commitment is the cause");
+            TestContext.Out.WriteLine("");
+
+            // 2 east per 1 north. Same start as PG so the first-leg offset is the one already
+            // measured there; only the heading changes.
+            foreach (int k in new[] { 12, 32, 44 })
+            {
+                FPVector3 start = NavAgentTestHelper.CellCenter(2, 2);
+                FPVector3 goal = NavAgentTestHelper.CellCenter(2 + 2 * k, 2 + k);
+                FP64 straight = FPVector2.Distance(start.ToXZ(), goal.ToXZ());
+
+                TestContext.Out.WriteLine(
+                    $"--- k={k,3}  (straight line {straight.ToDouble():F1}) ---");
+
+                foreach (double cell in new[] { 0.0, 16.0, 32.0 })
+                {
+                    var r = WalkOne(start, goal, cell);
+                    double ratio = r.distance / straight.ToDouble();
+                    TestContext.Out.WriteLine(
+                        $"  {(cell == 0 ? "flat   " : $"cell {cell,4:F0}")}  " +
+                        $"{r.status,-11} {r.ticks,5} ticks, travelled {r.distance,8:F1}" +
+                        (r.status == "Arrived"
+                            ? $"  ratio {ratio,5:F2}x straight, {r.legs,3} legs, "
+                              + $"detour {r.distance - straight.ToDouble(),7:F1}"
+                            : ""));
+                }
+                TestContext.Out.WriteLine("");
+            }
+
+            TestContext.Out.WriteLine(
+                "read the DETOUR column: constant-with-distance means one bad leg (cause 2), " +
+                "growing-with-distance means every crossing bends (cause 1)");
+        }
+
+        /// <summary>PG — Min against Mean for the cost fold (D-3's open choice).</summary>
+        [Test]
+        public void PG_WhichCostFold()
+        {
+            TestContext.Out.WriteLine("=== PG — cost fold: Min (admissible) vs Mean (realistic) ===");
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
+            foreach (var fold in new[] { FPNavAbstractCostFold.Min, FPNavAbstractCostFold.Mean })
+            {
+                var sw = Stopwatch.StartNew();
+                var g = new FPNavAbstractGraph(mesh, FP64.FromInt(16), fold,
+                    FPNavAgentSystem.DEFAULT_AREA_MASK);
+                sw.Stop();
+                TestContext.Out.WriteLine(
+                    $"  {fold,-5}  {g.NodeCount} nodes, {g.EdgeCount} edges, diameter {g.MaxNodeDiameter}, " +
+                    $"derive {sw.Elapsed.TotalMilliseconds:F2} ms, checksum {g.Checksum:X16}");
+            }
+            TestContext.Out.WriteLine(
+                "  (an open field gives every triangle the same multiplier, so the two agree here " +
+                "by construction — the choice only bites on a mesh with area costs)");
+        }
+
+        private static (string status, int ticks, double distance, int legs)
+            WalkOne(FPVector3 start, FPVector3 goal, double abstractCell)
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
+            var system = NavAgentTestHelper.CreateSystem(mesh, null);
+            if (abstractCell > 0)
+                system.SetAbstractGraph(new FPNavAbstractGraph(
+                    mesh, FP64.FromDouble(abstractCell), FPNavAbstractCostFold.Min,
+                    FPNavAgentSystem.DEFAULT_AREA_MASK));
+
+            var query = new FPNavMeshQuery(mesh, null);
+            int tri = query.FindTriangle(start.ToXZ(), start.y);
+            var frame = NavAgentTestHelper.CreateFrameWithAgent(start, tri, out var entity, out var entities);
+            ref var nav0 = ref frame.Get<NavAgentComponent>(entity);
+            NavAgentComponent.SetDestination(ref nav0, goal);
+
+            FPVector3 prev = start;
+            double travelled = 0;
+            const int budget = 20000;
+            for (int tick = 1; tick <= budget; tick++)
+            {
+                system.Update(ref frame, entities, 1, tick, NavAgentTestHelper.DT);
+                ref readonly var nav = ref frame.GetReadOnly<NavAgentComponent>(entity);
+                travelled += FPVector2.Distance(prev.ToXZ(), nav.Position.ToXZ()).ToDouble();
+                prev = nav.Position;
+
+                if (nav.Status == (byte)FPNavAgentStatus.Arrived)
+                    return ("Arrived", tick, travelled, system.DebugLegAdvanceCount);
+                if (nav.Status == (byte)FPNavAgentStatus.PathFailed)
+                    return ("PathFailed", tick, travelled, system.DebugLegAdvanceCount);
+            }
+            return ("timeout", budget, travelled, system.DebugLegAdvanceCount);
+        }
+
+        #endregion
 
         [Test]
         public void ClusterSize_Sweep_ShowsWhatTheSplitTrades()

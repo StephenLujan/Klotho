@@ -138,8 +138,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             // at the goal across the rows while the only path doubles back, so the budget goes
             // before the far end does.
             var mesh = NavAgentTestHelper.CreateSerpentineNavMesh(64, 40, out var endCell);
-            var query = new FPNavMeshQuery(mesh, null);
-            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+            // Partial paths off: this pins the raw budget failure the counter is about. With the
+            // 0.13 default (on) the same search returns a partial corridor and the counter still
+            // rises — FPNavPartialPathTests covers that side.
+            var off = new FPNavTuning(partialPathOnExhaustion: false);
+            var query = new FPNavMeshQuery(mesh, null, off);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, off);
 
             bool found = pathfinder.FindPath(
                 NavAgentTestHelper.CellCenter(0, 0),
@@ -189,8 +193,11 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             Assert.AreEqual(width * height * 2 + 8, mesh.Triangles.Length,
                 "start patch of width*height*2 triangles, plus the 2x2 island holding the goal");
 
-            var query = new FPNavMeshQuery(mesh, null);
-            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+            // Off, as above: the boundary is about the raw verdict and the counter, not about what
+            // a partial would hand back at it.
+            var off = new FPNavTuning(partialPathOnExhaustion: false);
+            var query = new FPNavMeshQuery(mesh, null, off);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, off);
 
             bool found = pathfinder.FindPath(
                 NavAgentTestHelper.CellCenter(0, 0),
@@ -420,5 +427,72 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         }
 
         #endregion
+
+        [Test]
+        public void LastSearchIterations_ReportsWhatTheSearchActuallySpent()
+        {
+            // "The budget ran out" is not actionable on its own: the budget is spent in TRIANGLES,
+            // so whether the ceiling is a lot depends on how finely the mesh is cut. This is the
+            // number that lets a tool say "4096 of 4096 popped to cover 22 units" — which points at
+            // a blocked line rather than a long one.
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(16);
+            var query = new FPNavMeshQuery(mesh, null);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+
+            Assert.AreEqual(0, pathfinder.DebugLastSearchIterations, "nothing has searched yet");
+
+            FPVector3 a = NavAgentTestHelper.CellCenter(0, 0);
+            FPVector3 b = NavAgentTestHelper.CellCenter(14, 14);
+            Assert.IsTrue(pathfinder.FindPath(a, b, FPNavAgentSystem.DEFAULT_AREA_MASK,
+                out _, out int len), "the open field is crossable");
+            Assert.Greater(len, 0);
+
+            int far = pathfinder.DebugLastSearchIterations;
+            Assert.Greater(far, 0, "a successful search still reports what it spent");
+            Assert.LessOrEqual(far, pathfinder.Tuning.MaxIterations, "and never more than the cap");
+
+            // Overwritten by each search, not accumulated — the whole point is that it describes
+            // the LAST one. A near neighbour must cost less than a corner-to-corner crossing.
+            Assert.IsTrue(pathfinder.FindPath(a, NavAgentTestHelper.CellCenter(1, 0),
+                FPNavAgentSystem.DEFAULT_AREA_MASK, out _, out _));
+            Assert.Less(pathfinder.DebugLastSearchIterations, far,
+                "a short hop must report fewer triangles than a long crossing, not the running total");
+        }
+
+        [Test]
+        public void LastSearchIterations_IsZeroWhenTheCallDidNotSearch()
+        {
+            // Four returns leave FindPath before A* starts. Leaving the field alone there kept the
+            // PREVIOUS search's count, and the visualizer prints this number as the evidence for the
+            // failure it is reporting — so an agent that stepped off the mesh got "popped 4096 of
+            // 4096" attached to it and the diagnosis went to the budget, which is exactly the
+            // misreading this field exists to remove.
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(16);
+            var query = new FPNavMeshQuery(mesh, null);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+
+            FPVector3 a = NavAgentTestHelper.CellCenter(0, 0);
+            Assert.IsTrue(pathfinder.FindPath(a, NavAgentTestHelper.CellCenter(14, 14),
+                FPNavAgentSystem.DEFAULT_AREA_MASK, out _, out _));
+            Assert.Greater(pathfinder.DebugLastSearchIterations, 0, "a real search to leave behind");
+
+            // Off the mesh: no start or end triangle, so nothing is popped.
+            var offMesh = new FPVector3(FP64.FromInt(10_000), FP64.Zero, FP64.FromInt(10_000));
+            Assert.IsFalse(pathfinder.FindPath(a, offMesh,
+                FPNavAgentSystem.DEFAULT_AREA_MASK, out _, out _));
+            Assert.AreEqual(0, pathfinder.DebugLastSearchIterations,
+                "a call that never entered the loop spent nothing, and must not report the last one's");
+
+            Assert.IsTrue(pathfinder.FindPath(a, NavAgentTestHelper.CellCenter(14, 14),
+                FPNavAgentSystem.DEFAULT_AREA_MASK, out _, out _));
+            Assert.Greater(pathfinder.DebugLastSearchIterations, 0, "and a real search still reports");
+
+            // Same triangle: a SUCCESS that never ran A*. Zero is the honest answer here too.
+            Assert.IsTrue(pathfinder.FindPath(a, a,
+                FPNavAgentSystem.DEFAULT_AREA_MASK, out _, out int len));
+            Assert.AreEqual(1, len, "start and end in one triangle is a one-triangle corridor");
+            Assert.AreEqual(0, pathfinder.DebugLastSearchIterations,
+                "the same-triangle shortcut is a success without a search");
+        }
     }
 }

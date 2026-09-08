@@ -448,6 +448,7 @@ navigate alike **before** the match starts, and it folds three things:
 | the mesh's content hash | *same stage* |
 | `NAV_BEHAVIOUR_REVISION` | *same pathfinding* — a hand-bumped constant standing for what `FindPath` returns for unchanged inputs |
 | `FPNavTuning.Digest` | *same caps* — see [Tuning the caps](#tuning-the-caps-fpnavtuning) |
+| `FPNavTuning.PartialPathDigest` | *same partial-path switch* — its own term, zero when off, so a tuning that never names it keeps the fingerprint it had (see [Partial paths](#partial-paths-when-the-budget-runs-out)) |
 
 Nothing new goes over the wire: the Ready exchange already compares an **environment fingerprint**
 that this value is folded into (in both P2P and server-driven modes), and the FullState resync's
@@ -512,11 +513,17 @@ inside a footprint wider than the cell ring; the refusal message says so.
 `FPNavPathFailure.Diagnose` re-walks `FindPath`'s guard chain against the mesh as it stands and
 reports which one: the agent is off the mesh, it stands on blocked ground, the destination is off
 the mesh or blocked or outside the agent's plan mask, the failure is *stale* (the mesh changed and
-nothing blocks it any more — set the destination again), or there is genuinely no route.
-`FPNavPathFailure.Describe` turns that into the suffix the row prints. The pathfinder's diagnostic
-counters are not used for this: the tool shares one pathfinder with its own Start/End path preview
-so a delta cannot be attributed, the counters never reset, and the case worth explaining most — an
-agent a rebake left off-mesh — never calls `FindPath`, so no counter ever moves for it.
+nothing blocks it any more — set the destination again), or the search itself failed.
+`FPNavPathFailure.Describe` turns that into the suffix the row prints. Handed the tool's **own**
+pathfinder, `Diagnose` splits that last case by searching again from where the agent stands (a
+`PathFailed` agent does not move): a drained open set is `NoRoute`, a spent budget is
+`BudgetExhausted` — which, with [partial paths](#partial-paths-when-the-budget-runs-out) on, means
+the closest point the budget reached was no closer than the agent already stood. Without a
+pathfinder the verdict stays the undivided `NoRouteOrBudget`. The pathfinder's *cumulative* counters
+are still not read for this: the tool shares one pathfinder with its own Start/End path preview so
+a lifetime delta cannot be attributed (the re-search takes its own before/after inside one call,
+which can), the counters never reset, and the case worth explaining most — an agent a rebake left
+off-mesh — never calls `FindPath`, so no counter ever moves for it.
 
 Both editor tools call the same member. It is public runtime API rather than editor-local for the
 reason `FindTriangleForEndpoint` is: Unity's tool is one fixed assembly, but the Godot adapter ships
@@ -581,6 +588,35 @@ So the first thing to build for hundreds of units is not a faster A* — it is *
 everyone at once**: a bounded admission queue (promote K destinations per tick), and for
 same-destination groups a flow field, which needs nothing from the engine that is not already public
 (see below).
+
+### What spreading the load does not do
+
+Both levers in this section — the admission queue and the cluster split below — **spread** work.
+Neither makes a search cheaper, so neither touches the failures. Be clear about that before
+budgeting around them:
+
+- **The ~42% that exhaust the budget still get no path.** They fail for the same reason whenever they
+  run. Admitting them over ten ticks produces ten ticks of failures instead of one.
+- **The admission queue does not fit a 10 Hz tick either.** Spread over ten ticks, the A* share is
+  ~97 ms — but by the last of those ticks every already-admitted unit is moving, so the steady-state
+  ~16 ms runs alongside it: **~113 ms against a 100 ms budget**, before any game logic or physics.
+- **The cluster split does not help here at all.** It reduces the steady-state tick by ~10 ms, which
+  is **1% of the order tick**. It is worth doing for the reasons in the next section; relieving a
+  mass order is not one of them.
+
+**`MaxIterations` is two things since 0.13**: the search budget, and the threshold above which the
+agent system installs an abstract graph on its own (`AutoInstallAbstractGraph`). Lowering it turns
+legs on for more meshes; raising it — to 65536, say — turns automatic legs off for a 22,000-triangle
+stage without saying so. There is deliberately no separate threshold: the budget is the exact
+condition under which a flat search can fail, and a second number would drift from it.
+
+**Raising `MaxIterations` is the wrong direction**, and it is worth saying because `FPNavTuning` now
+makes it reachable. The searches that exhaust the budget are the *expensive* ones; giving them a
+larger budget converts fast failures into slow successes and raises the total. The measured average
+of ~1.2 ms per agent is already a blend of successes and exhaustions, so it understates what an
+exhausting search costs. If cross-map orders on a large map are a requirement, the answer is a
+cheaper *kind* of search — planning in legs over an abstract graph, or a flow field for grouped
+destinations — not a bigger budget for the same one.
 
 ### Splitting the array into clusters
 
@@ -709,6 +745,300 @@ because the cost function and grouping policy differ per game, and anything the 
 Flyers have no off-mesh link concept — keep them out of the `entities` array entirely and steer them
 directly.
 
+### Planning in legs
+
+Everything above spreads the order tick around; none of it makes a search cheaper, which is why the
+failures survive it. The one thing that removes them is planning a **cheaper kind of search**: cut
+the walkable surface into nodes, hop nodes to pick a direction, and hand the real A\* only the
+current leg. A leg never leaves its node, so it never runs out of budget and never overruns the
+corridor buffer — the two caps stop binding instead of being raised.
+
+Measured on the same 96×96-cell field as the table above, 800 agents receiving one order:
+
+| | order tick | got no path | budget exhausted | corridor clamped |
+|---|---:|---:|---:|---:|
+| flat | 1001.7 ms | **358/800 (45%)** | 3,226 | 4,774 |
+| **in legs** | **38.0 ms** | **0** | **0** | **0** |
+
+**A hierarchical route is not the shortest one**, but the gap is small: a single unit crossing the
+field walks **1.10× the straight-line distance at worst** (1.11× at cell 32), and **1.01× on a long
+crossing** — the detour that remains is close to constant, so it dilutes as the route grows. Travel
+time tracks distance rather than exceeding it, and a unit changing legs dozens of times neither
+stalls nor circles at the boundaries.
+
+**Measure the ratio off the diagonal.** The first measurements of this were all taken at exactly
+45°, which on a square lattice is the one heading where the route steps cleanly through node
+centres — the detour there is close to constant, so it dilutes over distance and the ratio looks
+better the further you go. Off the diagonal it does not dilute: the per-crossing component stays,
+and the honest worst case is the one quoted above. Two things keep it there:
+
+- The abstract search prices its first and last hop from **where the agent actually stands and
+  where it is actually going**, not from the centres of the nodes those points sit in. An agent
+  that has just changed legs is on its node's boundary, so a portal chosen from the centre would
+  sit off the line it has to walk.
+- A leg aims **along the portal** rather than at its midpoint, at the point that makes the crossing
+  straightest given the portal after it. How much this is worth depends on how coarse the mesh is:
+  a portal is one triangle edge, so a fine triangulation leaves little room to slide along it.
+
+Two more things keep a unit from *behaving* badly at a node, both of which cost route length nothing
+and were only ever visible by watching:
+
+- **A leg ends when the crossing is made, not when the portal point is touched.** A portal is a
+  shared triangle edge, so reaching it leaves the agent on the near side with its node unchanged —
+  the planner would hand back the crossing just completed, and the hand-off keeps velocity, so the
+  unit circled instead of stalling. A plan that asks for the crossing just made is sent on to the
+  next one.
+- **A leg hands off at the agent's turning radius**, `v² / a`, rather than at the arrival threshold
+  used for the destination. An agent cannot hold an arc tighter than that, so asking it to pass
+  within a few centimetres of a portal it must turn at is asking for something no steering can do;
+  it orbits the point. Handing off earlier is not a loss of precision — the leg planner exists to
+  keep the *search* local, not to march the unit through gates.
+
+What remains is that the hops **between** the two ends are still priced centre to centre. On a long
+route that is where the leftover detour comes from.
+
+Cluster size is the dial, and it is bounded on both sides. Too small and a leg is two triangles long,
+so the unit commits to a portal every few metres for no gain; too large and a leg no longer fits the
+corridor buffer. On a 22k-triangle stage the usable window ran up to 32 world units per cell, with
+**16 the best measured** (larger cells detoured more without planning faster).
+
+Three things are worth knowing before reaching for it:
+
+- **It is on by default since 0.13, and the off switch is exact.** The agent system's constructor
+  installs a graph itself when the mesh is one a flat search can run out of budget on
+  (`triangles > MaxIterations`; `FPNavTuning.AutoInstallAbstractGraph`), choosing the cell size the
+  way `TryInstallAbstractGraphIfBeneficial` does. A mesh within the budget gets nothing and does not
+  change by a bit. With `autoInstallAbstractGraph: false` the system plans the flat path it always
+  did, bit for bit — that is how the two are compared on one fixture. Turning the default on moved
+  the fingerprint of every game whose mesh is past the budget (the graph's checksum is part of it),
+  which is why it shipped in the same minor version as the partial-path default: one break, not two.
+  A game that named `partialPathOnExhaustion: false` to keep its 0.12 replays must name this off too.
+- **It rides the navigation fingerprint.** The derived graph's checksum folds into
+  `GetNavFingerprint`, contributing zero when there is no graph. Two peers disagreeing about the
+  graph — one planning in legs and one not, or two with different cell sizes — differ there and are
+  caught by the Ready exchange, exactly like a mesh mismatch.
+- **Agents planning under a different mask take the flat path.** The graph is derived for one mask,
+  so planning an agent whose resolved plan mask is a different one against it would promise
+  crossings that mask forbids. They fall back rather than being told a route they cannot walk, and
+  `DebugMaskFallbackCount` reports how many — the number that decides whether per-mask graphs would
+  earn their memory. **Carrying an override is not itself the trigger**: an override that resolves
+  to the mask the graph was built for keeps its legs, so writing the default mask explicitly does
+  not quietly opt an agent out. The test is equality, which is narrower than the exact safety
+  condition (a graph mask that is a bit-subset of the agent's is also safe) — the narrower rule is
+  chosen because the wider one lets an `ALL_AREAS` agent be routed around footprints it could have
+  crossed, a detour only that agent pays and nothing reports.
+
+```csharp
+// The whole wiring. Decides whether this mesh needs legs, picks the cell size, installs.
+navSystem.TryInstallAbstractGraphIfBeneficial(out FP64 cellSize);
+```
+
+**Calling that moves this game's navigation fingerprint, and its existing replays stop loading.**
+That is the cost the engine will not pay on your behalf: nothing installs a graph automatically,
+precisely so the moment it happens is one you chose. On a mesh under both thresholds the call
+answers `NotNeeded`, installs nothing, and the fingerprint does not move — so adding the line to a
+small stage costs nothing at all.
+
+**Every outcome is logged, including the ones where nothing happens** — a game reads this decision from its boot log, and a branch that stays silent cannot be told apart from the call not having run. A small stage prints `planning in legs: off — not needed. 116 triangles is within both the corridor cap (128) and the search budget (4096)…`; a large one prints the cell size the ladder settled on, the node counts, which threshold was crossed, and the new fingerprint.
+
+The four outcomes are separate because they call for different responses: `Installed`, `NotNeeded`
+(the mesh cannot reach either failure), `AlreadyInstalled` (you picked your own cell size and it was
+left alone), `NoCellSizeFits` (no rung of the ladder produced nodes inside the corridor cap —
+returned as a value, never thrown, because this runs on the initialization path). The chosen cell
+size comes back out so a tool can draw the same partition and another peer can rebuild the identical
+graph.
+
+**Choosing the cell size yourself is still supported**, and is what the helper does underneath:
+
+```csharp
+var graph = new FPNavAbstractGraph(
+    mesh, FP64.FromInt(16), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK);
+navSystem.SetAbstractGraph(graph);       // null turns it back off
+```
+
+`FPNavAbstractGraph` is an opaque handle: build it, hand it over, and read `NodeCount`, `EdgeCount`,
+`MaxNodeDiameter`, `MaxLegCorridorTriangles`, `NodeComponentCount` and `Checksum` to tune it. The node and edge accessors stay internal — they are the
+representation rather than a format. A swap rebinds the graph along with the query, pathfinder and
+funnel, so hand it over once and leave it alone.
+
+**`SetAbstractGraph` refuses two things rather than letting them run.** A graph derived from a
+different mesh (node ids index that mesh's triangles, so the route would run through geometry that is
+not there — and every peer would agree, so it would never surface as a desync), and a graph whose
+widest node cannot fit the corridor. The second is what those two node measurements exist for: a leg
+stays inside its node, so a node too wide for the cap plans corridors that come back clamped, which
+is the silent replanning loop this whole section exists to remove.
+
+**Two numbers, because they count different things.** `MaxNodeDiameter` is a count of **hops** across
+the widest node — a node of one triangle is 0. `MaxLegCorridorTriangles` is a count of **triangles**,
+which is what `CorridorCap` counts, so it is the one to compare against the cap. It is two more than
+the diameter: one because a path of *d* hops visits *d + 1* triangles, and one because a leg aims at
+a point on the boundary itself, which can resolve to the triangle on the far side. Comparing the
+diameter against the cap directly is off by exactly that two.
+
+The measure is a double sweep — exact on a tree, a lower bound otherwise — so it catches a cell size
+that is clearly too large rather than proving the cap can never be reached;
+`DebugCorridorTruncatedCount` stays the runtime net for whatever slips through.
+
+**Decide from the mesh, not from taste — and there are two lines, not one.** A corridor cannot hold
+more triangles than the mesh has, and A* cannot expand more than it has either, so both failures have
+an exact necessary condition:
+
+| failure | necessary condition | default |
+|---|---|---|
+| corridor clamped | `triangles > FPNavTuning.CorridorCap` | 128 |
+| **search runs out of budget** | `triangles > FPNavTuning.MaxIterations` | 4096 |
+
+They are different lines and they mean different things. Between them a mesh can be clamped but
+cannot exhaust; past the second, units report `PathFailed` while standing on walkable ground. The
+failure that strands units is the **second** one — on a real 22k-triangle asset a flat search runs
+out after 22 world units — and a condition written against the corridor cap answers the wrong
+question. Read both from `system.Tuning`, not from the constants: those are the defaults, and an
+instance handed a different tuning still compiles against them.
+
+Necessary is not sufficient. Past either line the failure becomes *reachable*; whether an actual
+route reaches it depends on the shape of the mesh.
+
+`TryInstallAbstractGraphIfBeneficial` answers both and logs which one was true. Brawler's own stages
+are 116 and 60 triangles, so it declines there and the sample keeps the call as documentation — it
+turns itself on if a stage ever grows past a line, and says so when it does. Read the base mesh, not
+the rebaked one: the decision has to be identical on every peer and stay put for the match.
+
+**When it does install, the cell size is searched rather than guessed.** Node width scales with cell
+size and local triangle density, and density varies by an order of magnitude between assets, so no
+fixed value is safe everywhere and any formula carries a constant fitted to whatever meshes it was
+measured on. The helper derives at `mesh.GridCellSize * 16` and halves until the widest node fits
+`CorridorCap`, taking the first that does — the largest node that fits, so the graph holds the fewest
+nodes it can. Deriving is *cheaper* at larger cells, so the ladder spends its cheap probes first; on
+the 22k-triangle asset it settles in two derivations. The search runs once, at install: a rebake
+re-derives at the size it chose.
+
+**And when the graph is on but not shortening a particular search, that is reported.**
+`DebugExhaustedWithoutLegsCount` counts searches that ran out of budget while nothing was making them
+local — which includes plans that skipped an installed graph (a differently masked agent, an endpoint
+off the mesh, no abstract route). `DebugIterationExhaustedCount` alone cannot tell those from an
+overrun inside a healthy leg. The first occurrence is also logged once.
+
+**The other thing worth watching is a leg that ends the moment it is planned.** A leg hands off at
+the agent's turning radius `v² / a`, and nothing bounds that against the width of a node. Once the
+radius grows wider than a node, every leg target is already "reached" on the tick it is chosen: the
+hand-off fires immediately, clears the repath cooldown, and the agent runs a full A\* every tick —
+the opposite of what this feature is for.
+
+`DebugLegEndedOnPlanTickCount` counts exactly that, and it is a **rate**, read against
+`DebugLegAdvanceCount` beside it. Near zero is healthy — a leg that takes even one tick to walk never
+lands there. Climbing in step with the advances means the radius has swallowed a node, and a warning
+says so once with both numbers. Do **not** read `DebugLegAdvanceRepeatCount` for this: it rises about
+once per leg either way, so its ratio is the same whether or not anything is wrong.
+
+The fix is on the game's side of the line — lower the speed, raise the acceleration, or derive with a
+larger cell — because the radius is a property of how your units move.
+
+A game that rebakes at runtime rebuilds this graph on every swap, because it is derived from the
+mesh. You do not have to arrange anything for that: the engine builds the new graph a frame before
+the swap and the swap adopts it, so the cost stays off the tick.
+[Navigation.Rebake.md § 8](./Navigation.Rebake.md#8-performance) has the measured numbers and the
+two cases where a swap still rebuilds on the spot.
+
+#### Seeing it work
+
+`Tools > Klotho > Visualizer > NavMesh` (Godot: the FPNavMesh dock) can turn legs on over any
+navmesh asset you load, inside **Agent Simulation** — not at the top of the window, because the
+Pathfinding section's *Find Path* calls the pathfinder directly and is unaffected by the graph.
+
+Set a cell size, pick the mask to derive under, press **Apply**. What the panel then shows is what
+decides whether legs are doing anything:
+
+- **`NodeCount`** — one node means every route already ends inside it, so the path is the flat one.
+  That is correct, not broken; a mesh has to be big enough to have somewhere to hop to.
+- **widest node vs the corridor cap** — the refusal `SetAbstractGraph` would throw is pre-checked
+  and shown as text with both numbers, because raising the cell size until you meet it is normal
+  use of the dial.
+- **the counters**, which no editor tool used to show. `legs advanced` climbing is the feature
+  working. `abstract search failed` is the failure legs introduce and **the pathfinder's own budget
+  counter cannot see it** — that search never runs when the abstract one gives up first. `mask
+  fallback` counts agents whose plan mask is not the one the graph was derived under; matching them
+  in the per-agent mask controls is how you watch it drop to zero. The last two are the
+  pathfinder's and are **shared with the Find Path button**, so pressing that moves them with no
+  agent involved.
+
+Applying pauses the simulation, installs, hands every agent back to the planner and resumes — an
+agent already holding a corridor would otherwise keep walking the flat one and the button would
+look inert. Loading a different mesh drops the graph (a new agent system carries none), and the
+panel clears with it.
+
+### Partial paths when the budget runs out
+
+Legs make a search small. When they cannot — a mesh whose nodes never fit the corridor cap at any
+cell size, or a game that turned them off — a search that runs out of `MaxIterations` still
+has to answer. Before 0.13 it answered **nothing**: `FindPath` returned `false`, the agent sat at
+`PathFailed`, and it stayed there until the game gave it a new destination (a rebake does not
+re-plan it). Detour and Unity's NavMesh do not fail on cost; they return the path to the closest
+point the search reached, and since 0.13 so does Klotho by default —
+`FPNavTuning.PartialPathOnExhaustion` is on. The old answer is one named argument away:
+
+```csharp
+var tuning = new FPNavTuning(partialPathOnExhaustion: false);  // pre-0.13 behaviour, bit for bit
+```
+
+Naming it moves the navigation fingerprint (the switch is its own term of it), so peers and replays
+that disagree about the switch refuse each other — which is also why turning the default on was a
+minor version: every game that never named a tuning had its fingerprint move, and replays recorded
+before 0.13 are refused by a 0.13 build.
+
+**What the agent gets.** The corridor to the node that got closest to the destination by the
+search's own heuristic (ties to the lower triangle index, so the choice is a property of the mesh
+and not of the heap), clamped like any corridor with the agent's side kept. The agent aims at the
+**end of that corridor** rather than at the destination, so reaching it is the leg hand-off — a
+re-plan at full speed, not an arrival — and the next search starts from there. A partial is handed
+back only when the closest node is closer to the goal than the agent stands by **more than the
+agent's own hand-off radius** (`Speed² / Acceleration`, never below the arrival threshold); a
+corridor that ends inside that radius would be "reached" on the tick it was planned. Below that
+the search fails exactly as it does today, and it still fails for a drained open set: *there is no
+route* keeps its answer.
+
+**What it costs, and the failure it adds.** Every hop is a full-budget search, and hops follow each
+other without the repath cooldown. The new way to fail is **after moving**: the heuristic is a
+straight line, so a pocket whose closed side faces the goal — or, on a multi-floor mesh, the floor
+right under the goal — looks like progress, the unit walks into it, and the next search finds
+nothing closer and fails there. A `PathFailed` agent may therefore no longer stand where it was
+ordered from. Measured over the shipped `Field` asset (256 deterministic pairs, 105 of which exhaust
+the default budget), judging progress at the best node and walking the clamped chain reached the
+goal in 93 of 105 with a median of one hop and no cycle in 541 chains; at a quarter of the budget
+about half the chains end in a pocket, which is what the mode above looks like at scale. Judging
+the *clipped* end instead — the point the unit actually walks to — refused every winding route
+(0 of 37 on a serpentine, where each clipped end lies further from the goal than the hop started),
+which is why the rule is what it is.
+
+**Where a clipped chain ends.** The best node is always outside the unit's reach radius — its
+progress is at least that radius, and progress cannot exceed distance — but the corridor cap cuts
+at a count, and on a switchback that count landed the end straight across the wall from the unit,
+inside the radius at full speed. The hand-off then fired on the tick the plan was made, cleared the
+repath cooldown, and the next tick planned again: a full-budget search per tick until the unit's own
+motion carried the end away (measured at 62 such plans in bursts of 17 ticks on a 28-cell
+serpentine at speed 7, and 191 hand-offs against 71 at speed 9 on a 96-cell one). So a clipped
+partial now ends at the triangle of the kept prefix **farthest from the start** — a valid prefix of
+the chain, minus exactly the part that came back, which on a switchback is the turn. Unclipped
+partials are unchanged. `DebugPartialEndedOnPlanTickCount` on the agent system counts the event
+(exact without a graph, like the hand-off counter) and stays at zero.
+
+**When this and when legs.** Legs first, always: they make the failure not happen. This is the net
+under them — a mesh that cannot be cut, a game that has not cut it yet — and the two compose: with a
+graph installed, a leg search that exhausts gets a partial toward its portal instead of falling back
+to the flat search.
+
+**What moves.** The switch is part of the navigation fingerprint as its own term, zero when off, so
+peers that disagree about it are refused at Ready, on FullState, and on replay load, while a tuning
+that never names it keeps the fingerprint it had — it is deliberately *not* folded into
+`FPNavTuning.Digest`, whose chain would move every custom tuning's digest. `DebugPartialPathCount`
+and `DebugPartialRejectedCount` on the pathfinder count partials given and partials refused for no
+progress (both also count in `DebugIterationExhaustedCount` — the budget did run out);
+`DebugPartialHandoffCount` on the agent system counts partial ends reached, exactly without a graph
+and folded into `DebugLegAdvanceCount` with one (nothing in the frame says which kind of target
+`PathTarget` is, and a field for it would change the wire); it can trail `DebugPartialPathCount`,
+because a fast unit that leaves the corridor at a turn is re-planned by the off-corridor repath
+before it reaches the partial's end. The visualizers' Find Path marks a
+partial result as such, and the agent row's `BudgetExhausted` names the pocket case.
+
 ---
 
 ## Tuning the caps (`FPNavTuning`)
@@ -725,6 +1055,9 @@ var funnel     = new FPNavMeshFunnel(navMesh, query, logger, tuning);
 var navSystem  = new FPNavAgentSystem(navMesh, query, pathfinder, funnel, logger, tuning);
 navSystem.SetAvoidance(new FPNavAvoidance(tuning));
 ```
+
+`partialPathOnExhaustion` is the one *switch* among the caps and the one knob outside the digest —
+see [Partial paths when the budget runs out](#partial-paths-when-the-budget-runs-out).
 
 **Hand the same value to all five**, and `FPNavAgentSystem` checks that you did. The five types size
 buffers and bound loops from their own copy, so a stack whose parts disagree plans a corridor the

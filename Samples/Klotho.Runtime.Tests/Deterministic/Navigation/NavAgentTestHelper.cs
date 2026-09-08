@@ -81,12 +81,29 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         /// </summary>
         public static FPNavAgentSystem CreateSystem(FPNavMesh mesh, IKLogger logger,
             out FPNavMeshPathfinder pathfinder)
+            => CreateSystem(mesh, logger, FPNavTuning.Default, out pathfinder);
+
+        /// <summary>
+        /// The same stack under an explicit tuning. Since 0.13 the default tuning installs an
+        /// abstract graph on any mesh past the search budget, so a test that means to exercise flat
+        /// planning on a large mesh passes <see cref="NoAutoGraph"/> here — that is the pre-0.13
+        /// stack, bit for bit.
+        /// </summary>
+        public static FPNavAgentSystem CreateSystem(FPNavMesh mesh, IKLogger logger, FPNavTuning tuning,
+            out FPNavMeshPathfinder pathfinder)
         {
-            var query = new FPNavMeshQuery(mesh, logger);
-            pathfinder = new FPNavMeshPathfinder(mesh, query, logger);
-            var funnel = new FPNavMeshFunnel(mesh, query, logger);
-            return new FPNavAgentSystem(mesh, query, pathfinder, funnel, logger);
+            var query = new FPNavMeshQuery(mesh, logger, tuning);
+            pathfinder = new FPNavMeshPathfinder(mesh, query, logger, tuning);
+            var funnel = new FPNavMeshFunnel(mesh, query, logger, tuning);
+            return new FPNavAgentSystem(mesh, query, pathfinder, funnel, logger, tuning);
         }
+
+        /// <summary>
+        /// The default tuning with the automatic graph install off — what a fresh system was before
+        /// 0.13. Tests that assert flat planning, exhaustion counters or "no graph" on a mesh past
+        /// the budget build on this; the default is what a game gets.
+        /// </summary>
+        public static readonly FPNavTuning NoAutoGraph = new FPNavTuning(autoInstallAbstractGraph: false);
 
         #region Large synthetic meshes (crowd-scaling harness)
 

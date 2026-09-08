@@ -128,6 +128,20 @@ jobs:
       - name: Regenerate the addon and diff it against dist/
         run: .github/scripts/check-dist-sync.sh
 
+  sidecar-check:
+    name: Asset sidecars are complete
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # A .cs without its .cs.meta is invisible to Unity: the generated csproj omits it and the
+      # assembly stops compiling, while dotnet builds and tests stay green because they never
+      # read .meta. That exact combination has happened once: a new navigation source file was
+      # committed without its .cs.meta and only Unity noticed, long after the fact.
+      - name: Check .meta / .cs.uid
+        run: .github/scripts/check-asset-sidecars.sh
+
   version-check:
     name: Version manifests agree
     runs-on: ubuntu-latest

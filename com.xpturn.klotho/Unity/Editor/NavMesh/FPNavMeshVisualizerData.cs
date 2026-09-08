@@ -76,6 +76,13 @@ namespace xpTURN.Klotho.Editor
         public int WaypointCount;
         public List<(Vector3 left, Vector3 right)> Portals = new List<(Vector3, Vector3)>();
         public bool HasPath;
+        /// <summary>
+        /// The path above stops short of the end point: the search ran out of its budget and, with
+        /// <c>FPNavTuning.PartialPathOnExhaustion</c> on, returned the corridor to the closest
+        /// point it reached. Read off the pathfinder right after the call, which is the only moment
+        /// that flag belongs to this path.
+        /// </summary>
+        public bool PathIsPartial;
 
         public bool IsLoaded => NavMesh != null;
 
@@ -243,6 +250,7 @@ namespace xpTURN.Klotho.Editor
         public void InvalidatePathResult()
         {
             HasPath = false;
+            PathIsPartial = false;
             Corridor = null;
             CorridorLength = 0;
             Waypoints = null;
@@ -285,19 +293,42 @@ namespace xpTURN.Klotho.Editor
             Logger = loggerFactory.CreateLogger("FPNavMeshVisualizer");
         }
 
-        public bool LoadFromBytes(byte[] data)
+        /// <summary>
+        /// The tuning this tool's stack is built with — the query, pathfinder and funnel from
+        /// <see cref="LoadFromBytes(byte[], FPNavTuning)"/>, and through them the simulator's agent
+        /// system, its diagnosis pathfinder and the load-time exhaustion warning, which all read it
+        /// back. Default until a load says otherwise.
+        ///
+        /// <para>Why a load parameter and not a setter: the four hold the tuning they were
+        /// constructed with, and <c>FPNavAgentSystem</c> refuses a trio whose tuning differs from
+        /// its own. Changing it means rebuilding the stack, and the load path is the one place that
+        /// already does. So "apply" is "reload" — agents, placements and the leg graph go with it,
+        /// exactly as on any load.</para>
+        /// </summary>
+        public FPNavTuning ToolTuning { get; private set; } = FPNavTuning.Default;
+
+        /// <summary>Loads with the tuning of the previous load (default on the first).</summary>
+        public bool LoadFromBytes(byte[] data) => LoadFromBytes(data, ToolTuning);
+
+        /// <summary>
+        /// Loads and builds the tool's stack with <paramref name="tuning"/> — see
+        /// <see cref="ToolTuning"/> for why the tuning rides the load.
+        /// </summary>
+        public bool LoadFromBytes(byte[] data, FPNavTuning tuning)
         {
             if (EnableLogs)
                 CreateLogger();
 
             try
             {
-                
+                tuning.Validate();
+                ToolTuning = tuning;
+
                 var reader = new SpanReader(data);
                 NavMesh = FPNavMeshSerializer.Deserialize(ref reader);
-                Query = new FPNavMeshQuery(NavMesh, Logger);
-                Pathfinder = new FPNavMeshPathfinder(NavMesh, Query, Logger);
-                Funnel = new FPNavMeshFunnel(NavMesh, Query, Logger);
+                Query = new FPNavMeshQuery(NavMesh, Logger, tuning);
+                Pathfinder = new FPNavMeshPathfinder(NavMesh, Query, Logger, tuning);
+                Funnel = new FPNavMeshFunnel(NavMesh, Query, Logger, tuning);
 
                 BuildRenderCache();
                 ClearPath();
@@ -472,12 +503,17 @@ namespace xpTURN.Klotho.Editor
             FPVector3 startFP = start.ToFPVector3();
             FPVector3 endFP = end.ToFPVector3();
 
-            bool found = Pathfinder.FindPath(startFP, endFP, areaMask,
-                out int[] corridor, out int corridorLength);
+            // The eight-argument form: a tool asks for any progress at all (zero minimum — the
+            // agents pass their reach radius, and that is theirs to decide), and takes the partial
+            // flag and the partial END from the same call rather than reading them back off the
+            // pathfinder afterwards.
+            bool found = Pathfinder.FindPath(startFP, endFP, areaMask, FP64.Zero,
+                out int[] corridor, out int corridorLength, out bool partial, out FPVector3 partialEnd);
 
             if (!found)
             {
                 HasPath = false;
+                PathIsPartial = false;
                 return false;
             }
 
@@ -485,9 +521,14 @@ namespace xpTURN.Klotho.Editor
             Corridor = new int[corridorLength];
             System.Array.Copy(corridor, Corridor, corridorLength);
             CorridorLength = corridorLength;
+            PathIsPartial = partial;
 
-            // Funnel
-            Funnel.Funnel(corridor, corridorLength, startFP, endFP,
+            // Funnel — toward where the corridor actually ENDS. The funnel appends its end point as
+            // the last portal unconditionally, so funnelling a partial corridor toward the goal drew
+            // a straight line from the corridor's last triangle across ground the search never
+            // reached, under a label saying the path stops short. The agent system steers toward
+            // PathTarget, which is the partial end for the same reason; this is that mirror.
+            Funnel.Funnel(corridor, corridorLength, startFP, partial ? partialEnd : endFP,
                 out FPVector3[] waypoints, out int waypointCount);
 
             Waypoints = new Vector3[waypointCount];
@@ -507,6 +548,7 @@ namespace xpTURN.Klotho.Editor
             HasStart = false;
             HasEnd = false;
             HasPath = false;
+            PathIsPartial = false;
             Corridor = null;
             CorridorLength = 0;
             Waypoints = null;

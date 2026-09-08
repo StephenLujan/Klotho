@@ -171,7 +171,132 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
 
         #endregion
 
-        #region Describe — the seven strings are a contract, byte for byte
+        #region The two halves — endpoints every repaint, the search once
+
+        // Why the split exists: an editor asks the diagnosis on every repaint for every agent. The
+        // endpoint half is a few lookups and has to be re-asked (a rebake can make a failure stale
+        // under it); the search half pops up to MaxIterations triangles and its inputs do not change
+        // while the agent stands at PathFailed. Diagnose is the two composed, so a caller that
+        // keeps the second half must get exactly what a caller of Diagnose gets.
+
+        [Test]
+        public void Endpoints_StopAtNoRouteOrBudget_AndAreWhatDiagnoseSaysWithoutAPathfinder()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(Cells);
+            var query = new FPNavMeshQuery(mesh, null);
+            var nav = Failed(P(1, 0, 1), 0, P(11, 0, 11));
+
+            Assert.AreEqual(FPNavPathFailureReason.NoRouteOrBudget,
+                FPNavPathFailure.DiagnoseEndpoints(nav, query, mesh, false));
+            Assert.AreEqual(FPNavPathFailure.Diagnose(nav, query, mesh, false),
+                FPNavPathFailure.DiagnoseEndpoints(nav, query, mesh, false),
+                "without a pathfinder Diagnose IS the endpoint half");
+            Assert.AreEqual(FPNavPathFailureReason.StaleFailure,
+                FPNavPathFailure.DiagnoseEndpoints(nav, query, mesh, true));
+        }
+
+        [Test]
+        public void SearchVerdict_OnATinyBudget_IsBudgetExhausted_AndComposesToDiagnose()
+        {
+            // 48 cells = 96 units across; eight pops cannot reach the far corner. Partial paths off:
+            // the verdict this test is about is the one a failed search leaves behind, and with them
+            // on (the 0.13 default) eight pops hand back a partial instead.
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(48);
+            var tuning = new FPNavTuning(maxIterations: 8, partialPathOnExhaustion: false);
+            var query = new FPNavMeshQuery(mesh, null, tuning);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, tuning);
+            var nav = Failed(P(1, 0, 1), 0, P(93, 0, 93));
+
+            int before = pathfinder.DebugIterationExhaustedCount;
+            Assert.AreEqual(FPNavPathFailureReason.BudgetExhausted,
+                FPNavPathFailure.SearchVerdict(nav, pathfinder));
+            Assert.AreEqual(before + 1, pathfinder.DebugIterationExhaustedCount,
+                "the search half is the one that moves the counters — on the instance it was given");
+            Assert.AreEqual(FPNavPathFailureReason.BudgetExhausted,
+                FPNavPathFailure.Diagnose(nav, query, mesh, false, pathfinder),
+                "endpoints then search is Diagnose");
+        }
+
+        [Test]
+        public void SearchVerdict_OnAnIsland_IsNoRoute()
+        {
+            var mesh = NavAgentTestHelper.CreateSplitFieldNavMesh(12, out var farCell);
+            var query = new FPNavMeshQuery(mesh, null);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+            var nav = Failed(P(1, 0, 1), 0, NavAgentTestHelper.CellCenter(farCell.gx, farCell.gz));
+
+            Assert.AreEqual(FPNavPathFailureReason.NoRouteOrBudget,
+                FPNavPathFailure.DiagnoseEndpoints(nav, query, mesh, false),
+                "the endpoints cannot tell an island from a spent budget");
+            Assert.AreEqual(FPNavPathFailureReason.NoRoute,
+                FPNavPathFailure.SearchVerdict(nav, pathfinder));
+            Assert.AreEqual(FPNavPathFailureReason.NoRoute,
+                FPNavPathFailure.Diagnose(nav, query, mesh, false, pathfinder));
+        }
+
+        [Test]
+        public void StaleWins_BeforeTheSearchIsEverRun()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(48);
+            var tuning = new FPNavTuning(maxIterations: 8, partialPathOnExhaustion: false);
+            var query = new FPNavMeshQuery(mesh, null, tuning);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, tuning);
+            var nav = Failed(P(1, 0, 1), 0, P(93, 0, 93));
+
+            int before = pathfinder.DebugIterationExhaustedCount;
+            Assert.AreEqual(FPNavPathFailureReason.StaleFailure,
+                FPNavPathFailure.Diagnose(nav, query, mesh, true, pathfinder));
+            Assert.AreEqual(before, pathfinder.DebugIterationExhaustedCount,
+                "a verdict the endpoints already gave costs no search");
+        }
+
+        [Test]
+        public void SearchVerdict_GuardsMirrorDiagnose_NotFailedIsNone_NoPathfinderIsUndecided()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(Cells);
+            var query = new FPNavMeshQuery(mesh, null);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null);
+
+            var walking = Failed(P(1, 0, 1), 0, P(11, 0, 11));
+            walking.Status = (byte)FPNavAgentStatus.Moving;
+            Assert.AreEqual(FPNavPathFailureReason.None,
+                FPNavPathFailure.SearchVerdict(walking, pathfinder));
+
+            var failed = Failed(P(1, 0, 1), 0, P(11, 0, 11));
+            Assert.AreEqual(FPNavPathFailureReason.NoRouteOrBudget,
+                FPNavPathFailure.SearchVerdict(failed, null),
+                "no pathfinder, no split — the caller that skipped the first half still gets nothing false");
+        }
+
+        /// <summary>
+        /// The re-search asks for the caller's minimum progress, because the engine did. The engine's
+        /// floor is the agent system's WaypointThreshold; a diagnosis that used the default floor
+        /// could accept a partial the engine had refused and answer "cannot be explained" for a
+        /// failure whose cause it had just reproduced. Proven with a floor no partial can clear.
+        /// </summary>
+        [Test]
+        public void SearchVerdict_UsesTheCallersThreshold_AsTheEngineDid()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(48);
+            var tuning = new FPNavTuning(maxIterations: 8, partialPathOnExhaustion: true);
+            var query = new FPNavMeshQuery(mesh, null, tuning);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, tuning);
+            var nav = Failed(P(1, 0, 1), 0, P(93, 0, 93));
+
+            Assert.AreEqual(FPNavPathFailureReason.NoRouteOrBudget,
+                FPNavPathFailure.SearchVerdict(nav, pathfinder),
+                "default floor 0.3: eight pops make progress, the partial is accepted, and a found path cannot be explained");
+            Assert.AreEqual(FPNavPathFailureReason.BudgetExhausted,
+                FPNavPathFailure.SearchVerdict(nav, pathfinder, FP64.FromInt(100)),
+                "a floor no eight-pop partial can clear: the partial is refused, as the engine's was, and the cause is named");
+            Assert.AreEqual(FPNavPathFailureReason.BudgetExhausted,
+                FPNavPathFailure.Diagnose(nav, query, mesh, false, pathfinder, FP64.FromInt(100)),
+                "the Diagnose overload threads the same floor");
+        }
+
+        #endregion
+
+        #region Describe — the strings are a contract, byte for byte
 
         [Test]
         public void Describe_ReturnsTheStringsBothToolsUsedBeforeTheFold()
@@ -190,6 +315,13 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 FPNavPathFailure.Describe(FPNavPathFailureReason.StaleFailure));
             Assert.AreEqual(" ← no route (or the search budget ran out)",
                 FPNavPathFailure.Describe(FPNavPathFailureReason.NoRouteOrBudget));
+            // The two the re-search added. BudgetExhausted is mode-neutral: it used to carry a
+            // parenthetical about partial paths being on, which a tool running with them off then
+            // printed as the description of a mode its reader was not in.
+            Assert.AreEqual(" ← no route joins the agent to its destination",
+                FPNavPathFailure.Describe(FPNavPathFailureReason.NoRoute));
+            Assert.AreEqual(" ← the search budget ran out before it could decide",
+                FPNavPathFailure.Describe(FPNavPathFailureReason.BudgetExhausted));
         }
 
         [Test]

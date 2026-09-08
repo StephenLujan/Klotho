@@ -108,6 +108,21 @@ namespace Brawler
             _consumeBuilder = BuildUseConsumableCommand;
         }
 
+        // Planning in legs used to be wired here — first by hand against the wrong cap, then as one
+        // call to TryInstallAbstractGraphIfBeneficial. Since 0.13 the agent system's constructor
+        // makes that call itself (FPNavTuning.AutoInstallAbstractGraph, on by default) when the
+        // BASE mesh is one a flat search can run out of budget on, so there is nothing to wire.
+        // Brawler's stages (Stage01 116 triangles, Stage02 60) are within the 4096 budget and get
+        // NotNeeded; a stage that grows past it gets a graph, and that stage's older replays stop
+        // loading — the boot log says so at the moment it happens. A game that wants legs off, or
+        // its own cell size, passes a tuning with autoInstallAbstractGraph: false to the whole
+        // stack (query, pathfinder, funnel, system) and calls SetAbstractGraph itself.
+        //
+        // It still matters that the system is constructed on the BASE mesh (_navMesh above is
+        // readonly for that reason): the ladder's cell choice is part of the fingerprint, and the
+        // engine's FullState correction swaps a late joiner forward from the same base, so every
+        // peer derives the same graph.
+
         public void RegisterSystems(EcsSimulation simulation)
         {
             _simulation = simulation;
@@ -130,6 +145,7 @@ namespace Brawler
             agentSystem.LoadNavMeshObstacles();
             if (agentSystem.DebugObstacleCount == 0)
                 simulation.Frame.Logger?.KWarning($"[BrawlerSimulationCallbacks] ORCA obstacles empty — NavMesh obstacle wiring missing or boundary-free mesh");
+
 
             botFSMSystem = new BotFSMSystem(agentSystem);
             botFSMSystem.SetQuery(query);

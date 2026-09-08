@@ -78,6 +78,47 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// </summary>
         public int CorridorCap { get; }
 
+        /// <summary>
+        /// When a search runs out of <see cref="MaxIterations"/> with work still queued, hand back
+        /// the corridor to the node that got closest to the goal instead of nothing; the agent walks
+        /// it and re-plans from its end (see <c>FPNavMeshPathfinder.FindPath</c>). <b>On by
+        /// default since 0.13</b> — the way Detour and Unity's NavMesh answer a search that runs
+        /// out of budget. Off is the behaviour before the knob existed, bit for bit, and still a
+        /// named argument away for a game that wants a budget failure to stay a failure.
+        ///
+        /// <para>Deliberately NOT folded into <see cref="Digest"/>. It joins the navigation
+        /// fingerprint as its own term, <see cref="PartialPathDigest"/>, which is zero when off and
+        /// a fixed constant when on — so two peers that disagree about it are refused at Ready, on
+        /// FullState and on replay load. Flipping the default therefore moved the fingerprint of
+        /// every tuning that does not name the switch, the default one included: replays recorded
+        /// before 0.13 are refused by a 0.13 build, and mixed builds refuse each other. That is the
+        /// protection working, not a defect, and it is why the flip is a minor version.</para>
+        /// </summary>
+        public bool PartialPathOnExhaustion { get; }
+
+        /// <summary>
+        /// Whether <c>FPNavAgentSystem</c> installs an abstract graph on its own when the mesh is
+        /// one a flat search can run out of budget on (<c>triangles &gt; <see cref="MaxIterations"/></c>),
+        /// choosing the cell size itself — <c>TryInstallAbstractGraphIfBeneficial</c> run from the
+        /// constructor. <b>On by default since 0.13.</b> Off is a game that wires legs itself (its
+        /// own cell size, cost fold or mask through <c>SetAbstractGraph</c>) or wants flat planning
+        /// for an on/off comparison.
+        ///
+        /// <para><b>No fingerprint term of its own.</b> Its effect is the graph, and the graph's
+        /// checksum is already folded into the navigation fingerprint: two peers that disagree about
+        /// this switch agree on a small mesh (neither has a graph) and are refused on a large one
+        /// (one has a graph, one does not) — both the right answer. Counted by <see cref="Equals"/>
+        /// so a stack cannot be half on; not counted by <see cref="Digest"/>, like
+        /// <see cref="PartialPathOnExhaustion"/>.</para>
+        ///
+        /// <para><b>This makes <see cref="MaxIterations"/> two things at once</b>: the search budget
+        /// and the threshold above which legs turn on. A game that lowers the budget turns legs on
+        /// for more meshes; a game that raises it (say to 65536) turns automatic legs off for a
+        /// 22,000-triangle stage without saying so. There is deliberately no separate threshold —
+        /// the budget IS the exact condition under which a flat search can fail.</para>
+        /// </summary>
+        public bool AutoInstallAbstractGraph { get; }
+
         /// <summary>Obstacle line budget — derived, never set (see <see cref="MaxOrcaLines"/>).</summary>
         public int MaxObstLines => MaxOrcaLines - MaxNeighbors;
 
@@ -109,7 +150,9 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             int maxNeighbors = FPNavAvoidance.MAX_NEIGHBORS,
             int maxOrcaLines = FPNavAvoidance.MAX_ORCA_LINES,
             int moveMaxQueue = 48,
-            int corridorCap = NavAgentComponent.MAX_CORRIDOR)
+            int corridorCap = NavAgentComponent.MAX_CORRIDOR,
+            bool partialPathOnExhaustion = true,
+            bool autoInstallAbstractGraph = true)
         {
             MaxAgents = maxAgents;
             CollisionResolveIterations = collisionResolveIterations;
@@ -121,20 +164,30 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             MaxOrcaLines = maxOrcaLines;
             MoveMaxQueue = moveMaxQueue;
             CorridorCap = corridorCap;
+            PartialPathOnExhaustion = partialPathOnExhaustion;
+            AutoInstallAbstractGraph = autoInstallAbstractGraph;
         }
 
         // ── Identity: one field list, two very different consumers ──────────────────────
         //
-        // Equals and Digest must count the SAME ten knobs, so the list lives once, here. What they
+        // Equals and Digest must count the SAME ten caps, so the list lives once, here. What they
         // must NOT share is the fold: GetHashCode only has to hold within a process, while Digest
         // is compared ACROSS processes and builds. Deriving one from the other would make peers
         // disagree every run.
+        //
+        // PartialPathOnExhaustion is the one knob Equals counts and Digest does not: appending it to
+        // the chain below would move the digest of every NON-default tuning even at its default
+        // value, so it carries its own fingerprint term instead (PartialPathDigest).
         //
         // MaxObstLines is deliberately absent: it is MaxOrcaLines - MaxNeighbors, so counting it
         // would count the same information twice and would move the digest if that derivation ever
         // changed without any knob changing.
 
-        /// <summary>Equal knob for knob. Adding a knob means adding it here AND to <see cref="Digest"/>.</summary>
+        /// <summary>
+        /// Equal knob for knob. Adding a cap means adding it here AND to <see cref="Digest"/>; a
+        /// behaviour switch goes here and gets its own fingerprint term instead (see
+        /// <see cref="PartialPathDigest"/> for why).
+        /// </summary>
         public bool Equals(FPNavTuning other) =>
             MaxAgents == other.MaxAgents
             && CollisionResolveIterations == other.CollisionResolveIterations
@@ -145,7 +198,9 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             && MaxNeighbors == other.MaxNeighbors
             && MaxOrcaLines == other.MaxOrcaLines
             && MoveMaxQueue == other.MoveMaxQueue
-            && CorridorCap == other.CorridorCap;
+            && CorridorCap == other.CorridorCap
+            && PartialPathOnExhaustion == other.PartialPathOnExhaustion
+            && AutoInstallAbstractGraph == other.AutoInstallAbstractGraph;
 
         public override bool Equals(object obj) => obj is FPNavTuning other && Equals(other);
 
@@ -169,6 +224,8 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                 h = h * 31 + MaxOrcaLines;
                 h = h * 31 + MoveMaxQueue;
                 h = h * 31 + CorridorCap;
+                h = h * 31 + (PartialPathOnExhaustion ? 1 : 0);
+                h = h * 31 + (AutoInstallAbstractGraph ? 1 : 0);
                 return h;
             }
         }
@@ -191,6 +248,19 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// <para>Fixed multipliers, not <c>HashCode.Combine</c>: this value crosses processes.</para>
         /// </summary>
         public long Digest => unchecked(RawFold() ^ DefaultRawFold);
+
+        /// <summary>
+        /// The partial-path switch's own fingerprint term: <b>0 when off</b>, a fixed non-zero
+        /// constant when on. Kept OUT of <see cref="Digest"/> on purpose. That fold is a chain, and a
+        /// knob appended to a chain moves the digest of every non-default tuning even at the knob's
+        /// default value — the default digest stays 0 only because it is normalised against itself.
+        /// A separate term costs nothing when off, which is what "a replay recorded before the
+        /// feature is not refused by it" requires for custom tunings as well as the default.
+        /// </summary>
+        public long PartialPathDigest => PartialPathOnExhaustion ? PartialPathTerm : 0L;
+
+        // An arbitrary fixed constant. Only two things matter: it never changes, and it is not 0.
+        private const long PartialPathTerm = unchecked((long)0x9D3B7F2E5C6A1B47UL);
 
         private long RawFold()
         {

@@ -210,6 +210,29 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         public bool HasPendingRebake => _task != null;
 
         /// <summary>
+        /// The mesh a FINISHED slice task is holding, before any tick has installed it — null while
+        /// the task is still running, and null when the next install will come from the cache or a
+        /// synchronous rebuild instead.
+        ///
+        /// <para><b>Why this exists, and why it is only a read.</b> Work that must happen when a
+        /// mesh becomes live but does not have to happen ON the tick — deriving
+        /// <c>FPNavAbstractGraph</c> is the case this was added for — can be done off-tick only if
+        /// something can see the mesh before the tick does. Everything else here keeps the mesh
+        /// private until <see cref="IFPNavMeshInstaller.Install"/>, which is exactly the deterministic
+        /// moment; this hands out the same reference one step earlier so a caller can prepare
+        /// against it from the frame heartbeat.</para>
+        ///
+        /// <para><b>It changes nothing.</b> No slot moves, no task is consumed, no counter turns. A
+        /// caller that ignores it gets today's behaviour, and a caller that uses it must still work
+        /// when it returns null — the cache-hit and rebuild paths never populate it, and neither
+        /// does a boundary that finishes the task itself.</para>
+        ///
+        /// <para><b>Same thread as the tick.</b> This is not synchronised; it is meant for the frame
+        /// boundary the host also drives <see cref="AdvanceSlice"/> from.</para>
+        /// </summary>
+        public FPNavMesh PeekPreparedMesh => _taskDone && _task != null ? _task.Result : null;
+
+        /// <summary>
         /// Which in-flight task this is, counting up from 1. Never reused.
         ///
         /// <para>Exists because "is a task pending" cannot express the property that matters. A

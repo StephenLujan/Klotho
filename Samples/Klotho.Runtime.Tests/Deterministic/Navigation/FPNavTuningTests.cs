@@ -157,13 +157,78 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         }
 
         /// <summary>
-        /// The default path's navigation fingerprint is bit-identical to what it was before the
-        /// tuning term existed. Pinned to the value captured from the build immediately before this
-        /// change: it is the only way a test can assert "before and after", and it is what makes
-        /// replays recorded earlier still readable.
+        /// The default path's navigation fingerprint, pinned. It was bit-identical to the pre-tuning
+        /// build (0x303F02AD9AB50251) until 0.13 turned partial paths on by default; that flip moved
+        /// it by exactly the partial-path term and nothing else, which the second assertion proves —
+        /// the OFF stack still produces the pre-0.13 value, so a game that names the switch off gets
+        /// every old replay back. A move of the ON value that is NOT the term alone is the failure
+        /// this test exists to catch.
         /// </summary>
         [Test]
-        public void DefaultStack_NavFingerprint_DidNotMove()
+        public void DefaultStack_NavFingerprint_IsPinned_AndOffIsThePre013Value()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(8);
+            long Fp(FPNavTuning t)
+            {
+                var query = new FPNavMeshQuery(mesh, null, t);
+                var pathfinder = new FPNavMeshPathfinder(mesh, query, null, t);
+                var funnel = new FPNavMeshFunnel(mesh, query, null, t);
+                return new FPNavAgentSystem(mesh, query, pathfinder, funnel, null, t).GetNavFingerprint();
+            }
+
+            Assert.AreEqual(unchecked((long)0xAD047D83C6DF1916UL), Fp(FPNavTuning.Default),
+                "the default fingerprint moved — a change that alters replays for every game that "
+                + "never named a tuning; either bump the version and repin, or find the leak");
+            Assert.AreEqual(unchecked((long)0x303F02AD9AB50251UL), Fp(new FPNavTuning(partialPathOnExhaustion: false)),
+                "off is the pre-0.13 stack, bit for bit — this is what lets a game keep its old replays");
+            Assert.AreEqual(unchecked((long)0x303F02AD9AB50251UL ^ FPNavTuning.Default.PartialPathDigest),
+                Fp(FPNavTuning.Default), "the flip is exactly the partial-path term");
+        }
+
+        /// <summary>
+        /// The same pin for a NON-default tuning. The digest is what makes a custom stack differ
+        /// from the default one, and a fold that changes shape moves every custom digest even when
+        /// nothing about the custom values changed — so a feature that adds a knob must add it
+        /// OUTSIDE this fold (as its own term), and this constant is what says whether it did. The
+        /// pre-IMP111 value (0xDC7A49767F3709DD) is what a custom tuning that names the switch OFF
+        /// still produces; a custom tuning that does not name it inherits the 0.13 default and moved
+        /// by the term alone.
+        /// </summary>
+        [Test]
+        public void CustomStack_NavFingerprint_IsPinned_AndOffIsThePre013Value()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(8);
+            long Fp(FPNavTuning t)
+            {
+                var query = new FPNavMeshQuery(mesh, null, t);
+                var pathfinder = new FPNavMeshPathfinder(mesh, query, null, t);
+                var funnel = new FPNavMeshFunnel(mesh, query, null, t);
+                return new FPNavAgentSystem(mesh, query, pathfinder, funnel, null, t).GetNavFingerprint();
+            }
+
+            long inheritsDefault = Fp(new FPNavTuning(corridorCap: 32));
+            TestContext.Out.WriteLine($"custom fingerprint = 0x{inheritsDefault:X16}");
+            Assert.AreEqual(unchecked((long)0x41413658235D129AUL), inheritsDefault,
+                "a custom tuning's fingerprint moved for unchanged values — a knob was added to the "
+                + "digest's fold instead of as a separate term, and every replay recorded with a "
+                + "custom tuning is now refused");
+            Assert.AreEqual(unchecked((long)0xDC7A49767F3709DDUL), Fp(new FPNavTuning(corridorCap: 32, partialPathOnExhaustion: false)),
+                "naming the switch off gives the pre-0.13 custom fingerprint back, bit for bit");
+        }
+
+        /// <summary>
+        /// The same pin, with a graph installed. It was captured deliberately BEFORE the work that
+        /// moved graph derivation off the swap tick, because that work's whole safety claim is that
+        /// every path produces the SAME graph — and a test written afterwards cannot check "same as
+        /// before" when there is no before left to compare against.
+        ///
+        /// <para>Two numbers, not one. <see cref="FPNavAbstractGraph.Checksum"/> is the derivation's
+        /// own fold and moves if any pass changes; the fingerprint is what a peer REFUSES on. A
+        /// change that moved only the first would be a silent divergence between peers built either
+        /// side of it.</para>
+        /// </summary>
+        [Test]
+        public void GraphInstalled_ChecksumAndFingerprint_DidNotMove()
         {
             var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(8);
             var query = new FPNavMeshQuery(mesh, null);
@@ -171,9 +236,17 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             var funnel = new FPNavMeshFunnel(mesh, query, null);
             var system = new FPNavAgentSystem(mesh, query, pathfinder, funnel, null);
 
-            Assert.AreEqual(unchecked((long)0x303F02AD9AB50251UL), system.GetNavFingerprint(),
-                "adding the tuning term must not move the default fingerprint — if it does, every "
-                + "replay recorded before this change is refused for a change that altered nothing");
+            var graph = new FPNavAbstractGraph(mesh, FP64.FromInt(8), FPNavAbstractCostFold.Min,
+                FPNavAgentSystem.DEFAULT_AREA_MASK);
+            system.SetAbstractGraph(graph);
+
+            Assert.AreEqual(0x3E8EB5BA08262583UL, graph.Checksum,
+                "the derivation fold — moves if any pass changes");
+            // 0x0EB1B717929327D2 before 0.13; moved by exactly the partial-path term when the
+            // default flipped, and by nothing else — the checksum above did not move.
+            Assert.AreEqual(unchecked((long)0x938AC839CEF93C95UL), system.GetNavFingerprint(),
+                "what a peer REFUSES on — a change that moved only the checksum above would be a "
+                + "silent divergence between peers built either side of it");
         }
 
         [Test]

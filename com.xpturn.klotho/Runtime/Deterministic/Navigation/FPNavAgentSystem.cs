@@ -7,10 +7,43 @@ using xpTURN.Klotho.ECS;
 namespace xpTURN.Klotho.Deterministic.Navigation
 {
     /// <summary>
+    /// What <see cref="FPNavAgentSystem.TryInstallAbstractGraphIfBeneficial"/> did. Four outcomes
+    /// rather than a bool: three of them mean "no graph", and they call for different responses —
+    /// <see cref="NotNeeded"/> is the expected answer on a small stage, <see cref="AlreadyInstalled"/>
+    /// says the game already made this decision itself, and <see cref="NoCellSizeFits"/> is a mesh
+    /// the helper could not serve at all.
+    /// </summary>
+    public enum FPNavAbstractGraphInstall : byte
+    {
+        /// <summary>A graph was derived and installed. The chosen cell size is the out parameter.</summary>
+        Installed = 0,
+
+        /// <summary>
+        /// The mesh is small enough that the failure asked about is not reachable, so a graph would
+        /// move the navigation fingerprint for nothing. See the two exact conditions on the helper —
+        /// the automatic install from the constructor asks only about budget exhaustion, an explicit
+        /// call asks about the corridor clamp as well.
+        /// </summary>
+        NotNeeded = 1,
+
+        /// <summary>
+        /// A graph was already installed and the helper left it alone. A game that picked its own
+        /// cell size keeps it.
+        /// </summary>
+        AlreadyInstalled = 2,
+
+        /// <summary>
+        /// Every cell size on the ladder left a node wider than <see cref="FPNavTuning.CorridorCap"/>,
+        /// down to the mesh's own broadphase cell. Nothing was installed and nothing was thrown.
+        /// </summary>
+        NoCellSizeFits = 3,
+    }
+
+    /// <summary>
     /// Per-tick agent update system.
     /// Handles path requests, steering, movement, and NavMesh constraints.
     /// </summary>
-    public class FPNavAgentSystem : INavFingerprintSource
+    public class FPNavAgentSystem : INavFingerprintSource, INavGraphPreparer
     {
         // Non-readonly: SwapNavMesh rebinds these to a rebaked mesh at runtime.
         private FPNavMesh _navMesh;
@@ -140,6 +173,144 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         public FP64 MultiFloorYThreshold = FP64.FromDouble(2.0);
 
         /// <summary>
+        /// Times the abstract graph's re-derivation on a navmesh swap and puts the number in the
+        /// swap log. Off by default: reading the clock is cheap but not free, and a diagnostic that
+        /// nobody asked for should not ride the deterministic command path.
+        ///
+        /// <para><b>Why this is a field here and not the engine's
+        /// <c>SystemPerfMonitoring</c>.</b> That switch reaches update SYSTEMS, through
+        /// <c>EcsSimulation.EnableSystemPerfMonitor</c> and the system runner. A navmesh swap is not
+        /// a system — it happens in a command handler — so that instrumentation never covers this
+        /// call, and this type holds no reference to <c>ISimulationConfig</c> to read the flag from
+        /// anyway. The smallest honest answer is a field the game sets, in the shape
+        /// <see cref="MultiFloorYThreshold"/> already established.</para>
+        ///
+        /// <para><b>Peers need not agree on it.</b> It changes nothing but a log line — no state, no
+        /// hash, no timing that any decision reads.</para>
+        /// </summary>
+        public bool DebugTimeGraphDerivation;
+
+        private int _graphRederiveCount;
+        private bool _prepareWarned;
+
+        /// <summary>
+        /// Diagnostic: how many times a swap re-derived the abstract graph. Counted always, unlike
+        /// the timing above, because the FREQUENCY is what decides whether the cost is worth moving
+        /// and it costs an increment to know.
+        ///
+        /// <para>Zero on a game that installs no graph — which is most of them, and the reason this
+        /// cost went unnoticed for as long as it did.</para>
+        /// </summary>
+        public int DebugGraphRederiveCount => _graphRederiveCount;
+
+        // The idle half of a double buffer. Prepared derivations go in here; adopting swaps it with
+        // the live graph and the outgoing one becomes the next spare. Two instances, forever — see
+        // PrepareAbstractGraphFor for why that number and not a pool.
+        private FPNavAbstractGraph _spareGraph;
+        private FPNavMesh _preparedMesh;          // what _spareGraph was derived for, or null
+        private long _preparedFingerprint;
+        private int _graphPreparedAdoptedCount;
+        private int _graphPreparedMissedCount;
+        private int _graphInstancesCreated;
+
+        /// <summary>
+        /// The graph agents are planning against right now, or null. Internal because it is the
+        /// representation rather than an API — a game hands one in through
+        /// <see cref="SetAbstractGraph"/> and reads the diagnostics, it does not reach back for the
+        /// object. What needs it is the assertion that adopting a prepared graph and deriving one
+        /// synchronously produce the SAME graph, which has to compare the two checksums directly.
+        /// </summary>
+        internal FPNavAbstractGraph CurrentAbstractGraph => _abstractGraph;
+
+        /// <summary>
+        /// The graph agents are planning against right now, or null. Public since legs turned on by
+        /// default (0.13): a tool that shows the partition can no longer assume a fresh system has
+        /// none, and a game that wants to know what the constructor decided reads it here — the
+        /// object itself stays the runtime's (see <see cref="SetAbstractGraph"/> for the one door in).
+        /// </summary>
+        public FPNavAbstractGraph AbstractGraph => _abstractGraph;
+
+        /// <summary>Diagnostic: swaps that took a graph prepared off-tick instead of deriving one.</summary>
+        public int DebugGraphPreparedAdoptedCount => _graphPreparedAdoptedCount;
+
+        /// <summary>
+        /// Diagnostic: swaps where a preparation existed but was NOT for the mesh being installed, so
+        /// the derivation happened on the tick anyway. <b>This is the number that says whether
+        /// preparing is worth calling</b> — the driver's cache-hit and rebuild paths never hand a
+        /// mesh to the heartbeat, and a boundary that finishes its own task does not either, so a
+        /// game whose swaps mostly come from those will see this climb and the adopted count stay
+        /// flat. Read the two together, against the driver's own <c>CacheHits</c> and
+        /// <c>RebuildInstalls</c>.
+        /// </summary>
+        public int DebugGraphPreparedMissedCount => _graphPreparedMissedCount;
+
+        /// <summary>
+        /// Diagnostic: <see cref="FPNavAbstractGraph"/> instances THIS system has allocated —
+        /// <b>at most one, ever</b>, the spare half of the double buffer. The live graph is the
+        /// game's, made once and never replaced by this type.
+        ///
+        /// <para>It exists because the obvious way to prepare — derive a fresh graph each time —
+        /// throws away exactly what <c>Rebind</c> was written for (buffer reuse) and leaves a
+        /// graph's worth of garbage per rebake. Byte-level allocation gates in this repository are
+        /// skipped by default, so the invariant needs an assertion that always runs.</para>
+        /// </summary>
+        public int DebugGraphInstancesCreated => _graphInstancesCreated;
+
+        /// <summary>
+        /// Derives, ahead of time and OFF the deterministic path, the graph a coming navmesh swap
+        /// will need. <b>Call it from the frame heartbeat</b> — the same place the host drives
+        /// <c>FPNavMeshRebakeDriver.AdvanceSlice</c> — passing that driver's
+        /// <c>PeekPreparedMesh</c>. Nulls and repeats are free.
+        ///
+        /// <para><b>What it buys.</b> A swap otherwise re-derives the whole graph inside the tick;
+        /// measured at 10.15 ms on the Field asset at the cell size the install ladder picks, against
+        /// the 2.13 ms budget a sliced rebake exists to hold. The derivation is a pure function of
+        /// (mesh, cell size, cost fold, area mask), so doing it early changes nothing about the
+        /// result — only when the clock is spent.</para>
+        ///
+        /// <para><b>Skipping it is not a different behaviour.</b> A peer that never calls this, or
+        /// calls it and misses, derives synchronously and gets the SAME graph: same checksum, same
+        /// fingerprint, same routes. Peers may therefore disagree about whether they prepared, run
+        /// at different frame rates, or mix a game that wires this with one that does not.
+        /// <b>Nothing here is allowed to break that</b>, which is why adoption is conservative below
+        /// rather than clever.</para>
+        ///
+        /// <para><b>Same thread as the simulation.</b> Nothing here is synchronised, and the live
+        /// graph is read by every planning agent. The frame boundary the host drives slicing from is
+        /// that thread; a job is not.</para>
+        ///
+        /// <para>Does nothing when no graph is installed — there is no cell size to derive at, and a
+        /// game with legs off has no cost to move.</para>
+        /// </summary>
+        public void PrepareAbstractGraphFor(FPNavMesh mesh)
+        {
+            if (mesh == null || _abstractGraph == null || ReferenceEquals(mesh, _navMesh))
+                return;
+
+            // Already prepared for exactly this one. Re-deriving would be correct and wasteful: the
+            // heartbeat runs every frame and the task's mesh sits there until a tick takes it.
+            if (ReferenceEquals(_preparedMesh, mesh))
+                return;
+
+            if (_spareGraph == null)
+            {
+                // The one allocation, matched to the live graph's build identity so the two are
+                // interchangeable. CellSize/CostFold/AreaMask are exposed for exactly this.
+                _spareGraph = new FPNavAbstractGraph(
+                    mesh, _abstractGraph.CellSize, _abstractGraph.CostFold,
+                    _abstractGraph.AreaMask, _logger);
+                _graphInstancesCreated++;
+            }
+            else
+            {
+                _spareGraph.Rebind(mesh);
+            }
+
+            _preparedMesh = mesh;
+            _preparedFingerprint = unchecked((long)FPNavMeshRebaker.ComputeFingerprint(mesh));
+        }
+
+        /// <summary>
         /// Graph-local obstacle BFS climb cap: an agent's query never expands to a triangle whose
         /// centerY differs from the seed triangle's by more than this. On meshes that record a
         /// bake slope (FPNavMesh.BakeMaxSlopeDeg &gt; 0) the query auto-derives the sound bound
@@ -198,6 +369,44 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         public static int ResolveWalkMask(in NavAgentComponent nav)
             => nav.WalkAreaMaskOverride != 0 ? nav.WalkAreaMaskOverride : DEFAULT_AREA_MASK;
 
+        /// <summary>What <see cref="WaypointThreshold"/> starts at.</summary>
+        public const double DEFAULT_WAYPOINT_THRESHOLD = 0.3;
+
+        /// <summary>
+        /// The hand-off radius: the tightest arc an agent moving at <paramref name="speed"/> with
+        /// <paramref name="acceleration"/> can hold, <c>speed² / acceleration</c>, never below
+        /// <paramref name="threshold"/>; the threshold alone when there is no acceleration to
+        /// divide by.
+        ///
+        /// <para><b>One function, two callers, and the two must agree.</b>
+        /// <see cref="ReachRadius"/> asks it at the agent's CURRENT speed to decide when a leg or
+        /// partial end counts as reached; <see cref="PartialMinProgress"/> asks it at the agent's
+        /// TOP speed to decide how much progress a partial corridor must make before it is worth
+        /// walking. The guarantee that a partial's best node is never already inside the reach
+        /// radius on the tick it is planned rests on <c>PartialMinProgress ≥ ReachRadius</c> for
+        /// every speed the agent can have — progress cannot exceed distance, and this function is
+        /// monotone in speed with speed clamped to <c>Speed</c> by the movement pass. Two
+        /// hand-written copies of the formula held that only while nobody edited one of them.</para>
+        /// </summary>
+        internal static FP64 HandoffRadius(FP64 speed, FP64 acceleration, FP64 threshold)
+        {
+            if (acceleration <= FP64.Zero)
+                return threshold;
+            FP64 r = speed * speed / acceleration;
+            return r > threshold ? r : threshold;
+        }
+
+        /// <summary>
+        /// The least a partial corridor must bring this agent closer to its goal to be worth
+        /// walking: the widest hand-off radius the agent can have (<see cref="HandoffRadius"/> at
+        /// <c>Speed</c>, the arc it holds at full speed — see <see cref="ReachRadius"/>), never below
+        /// the arrival threshold. A partial end closer than this would be "reached" on the tick it
+        /// was planned, and the re-plan from there would start where the last one did.
+        /// </summary>
+        /// <param name="waypointThreshold">The system's <see cref="WaypointThreshold"/>; a tool without one passes <see cref="DEFAULT_WAYPOINT_THRESHOLD"/>.</param>
+        public static FP64 PartialMinProgress(in NavAgentComponent nav, FP64 waypointThreshold)
+            => HandoffRadius(nav.Speed, nav.Acceleration, waypointThreshold);
+
         public FPNavAgentSystem(FPNavMesh navMesh, FPNavMeshQuery query,
             FPNavMeshPathfinder pathfinder, FPNavMeshFunnel funnel, IKLogger logger,
             FPNavTuning? tuning = null)
@@ -222,8 +431,26 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             _candidateSegs = new int[_tuning.BfsFrontierCap * 3];
             _corridorBuffer = new int[_tuning.CorridorCap];
 
-            WaypointThreshold = FP64.FromDouble(0.3);
+            WaypointThreshold = FP64.FromDouble(DEFAULT_WAYPOINT_THRESHOLD);
             _avoidance = null;
+
+            // Legs on by default (0.13): a mesh a flat search can run out of budget on gets an
+            // abstract graph here, before the first tick and before Ready compares fingerprints.
+            // HERE and not in the first Update: the graph's checksum is part of the navigation
+            // fingerprint, and a fingerprint that moved after the Ready exchange would let two peers
+            // agree at the handshake and diverge a tick later. Only the exhaustion condition — the
+            // corridor clamp is a walk-and-replan the flat planner already handles, and asking about
+            // it too would put a graph on every mesh past 128 triangles. Never throws; every outcome
+            // is logged; a game that wires its own graph turns this off in the tuning or simply
+            // installs over it (SetAbstractGraph replaces). This must run on the BASE mesh: the
+            // ladder's choice is part of the fingerprint, and a peer that built its system on a
+            // rebaked mesh would pick a different cell than the peers that built on the base and
+            // rebound — which is why a late joiner is constructed on the base and swapped forward.
+            // A null mesh is the "no navigation" sentinel some hosts build (GetNavFingerprint
+            // answers zero for it); there is nothing to partition and nothing to log.
+            if (_tuning.AutoInstallAbstractGraph && _navMesh != null)
+                InstallAbstractGraphCore(out _, FPNavAbstractCostFold.Min, DEFAULT_AREA_MASK,
+                    exhaustionOnly: true, automatic: true);
         }
 
         /// <summary>
@@ -277,6 +504,8 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                 return $"MoveMaxQueue {mine.MoveMaxQueue} vs {theirs.MoveMaxQueue}";
             if (mine.CorridorCap != theirs.CorridorCap)
                 return $"CorridorCap {mine.CorridorCap} vs {theirs.CorridorCap}";
+            if (mine.PartialPathOnExhaustion != theirs.PartialPathOnExhaustion)
+                return $"PartialPathOnExhaustion {mine.PartialPathOnExhaustion} vs {theirs.PartialPathOnExhaustion}";
             return "none (equal)";
         }
 
@@ -287,6 +516,541 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         {
             RequireSameTuning(avoidance?.Tuning, nameof(avoidance));
             _avoidance = avoidance;
+        }
+
+        private FPNavAbstractGraph _abstractGraph;
+
+        /// <summary>
+        /// Installs the abstract graph, which turns planning into legs: the agent aims at the next
+        /// portal instead of at its destination, and asks again when it gets there. <b>Null is the
+        /// off switch</b> and restores the flat path exactly — bit for bit, which is what lets a
+        /// game measure the two against each other and what keeps replays recorded without legs
+        /// valid.
+        ///
+        /// <para><b>Derive against the same mesh this system runs on.</b> A swap rebinds the graph
+        /// along with the query, pathfinder and funnel, so hand it over once and leave it alone.</para>
+        ///
+        /// <para><b>Every peer must install the same graph.</b> The cell size and cost fold change
+        /// where agents walk, so they are build identity rather than preference — the graph's
+        /// checksum folds into <see cref="GetNavFingerprint"/> and contributes zero when there is
+        /// none, so legs-on against legs-off and two different cell sizes are both caught by the
+        /// Ready exchange.</para>
+        ///
+        /// <para><b>Refused if a leg could not fit the corridor.</b> A leg never leaves its node, so
+        /// the widest node bounds the longest leg; a graph whose
+        /// <see cref="FPNavAbstractGraph.MaxLegCorridorTriangles"/> exceeds
+        /// <see cref="FPNavTuning.CorridorCap"/> would hand the planner corridors it has to clamp,
+        /// and a clamped corridor is the silent replanning loop this feature exists to remove.
+        /// <b>That property, not <see cref="FPNavAbstractGraph.MaxNodeDiameter"/>, is what the cap
+        /// compares against</b> — the diameter counts HOPS and the cap counts TRIANGLES, and reading
+        /// one as the other put this boundary two on the wrong side. The measure is a double sweep,
+        /// which is exact on a tree and a lower bound otherwise — so this catches a cell size that
+        /// is clearly too large rather than proving the cap can never be reached.
+        /// <see cref="FPNavMeshPathfinder.DebugCorridorTruncatedCount"/> stays the runtime net for
+        /// what slips through.</para>
+        /// </summary>
+        /// <exception cref="System.ArgumentException">
+        /// The graph was derived from a different mesh, or a leg through its widest node would ask
+        /// for more triangles than the corridor cap.
+        /// </exception>
+        public void SetAbstractGraph(FPNavAbstractGraph graph)
+        {
+            if (graph != null)
+            {
+                if (!ReferenceEquals(graph.CurrentMesh, _navMesh))
+                    throw new System.ArgumentException(
+                        "FPNavAgentSystem.SetAbstractGraph: the graph was derived from a different " +
+                        "mesh than this system runs on. Node ids index that mesh's triangles, so " +
+                        "planning against it would follow a route through geometry that is not there.",
+                        nameof(graph));
+
+                if (graph.MaxLegCorridorTriangles > _tuning.CorridorCap)
+                    throw new System.ArgumentException(
+                        $"FPNavAgentSystem.SetAbstractGraph: a leg through the widest node can ask " +
+                        $"for {graph.MaxLegCorridorTriangles} triangles ({graph.MaxNodeDiameter} " +
+                        $"hops across it, plus the portal's far side) against a corridor cap of " +
+                        $"{_tuning.CorridorCap}. A leg stays inside its node, so a node wider than " +
+                        $"the cap plans corridors that come back clamped — the silent replanning " +
+                        $"loop legs exist to remove. Derive with a smaller cell size.",
+                        nameof(graph));
+
+                // Replacing the constructor's automatic graph is allowed and costs only the
+                // derivation that is now thrown away. Said once, so a game that meant to wire its own
+                // graph learns it can turn the automatic one off in the tuning — and so nothing here
+                // can turn a migration into a failed boot.
+                if (_abstractGraph != null && !ReferenceEquals(_abstractGraph, graph)
+                    && _tuning.AutoInstallAbstractGraph && !_autoGraphReplacedLogged)
+                {
+                    _autoGraphReplacedLogged = true;
+                    _logger?.KInformation(
+                        $"[FPNavAgentSystem] SetAbstractGraph replaced the graph this system already " +
+                        $"had ({_abstractGraph.NodeCount} nodes at cell {_abstractGraph.CellSize.ToDouble():F2}) " +
+                        $"with the game's own ({graph.NodeCount} nodes at cell {graph.CellSize.ToDouble():F2}). " +
+                        $"The one it had was the automatic install (FPNavTuning.AutoInstallAbstractGraph); " +
+                        $"a game that wires its own graph can turn that off and skip the derivation " +
+                        $"it just discarded.");
+                }
+            }
+            _abstractGraph = graph;
+        }
+
+        /// <summary>
+        /// The ladder <see cref="TryInstallAbstractGraphIfBeneficial"/> walks, as a multiple of the
+        /// mesh's own broadphase cell: start there and halve down to the broadphase cell itself.
+        /// Measured across four assets, all of which bake at 4.0 — so this is the widest rung any
+        /// of them was seen to need, not a law.
+        /// </summary>
+        private const int LEG_CELL_LADDER_START_MULTIPLE = 16;
+
+        /// <summary>
+        /// Installs an abstract graph when this mesh is one where flat planning can fail, choosing
+        /// the cell size itself. This is the one-line form of what a game would otherwise copy out
+        /// of the sample — it answers <i>should legs be on here</i> and <i>how big should a node be</i>
+        /// so the game does not have to.
+        ///
+        /// <para><b>Since 0.13 the constructor calls this itself</b> when
+        /// <see cref="FPNavTuning.AutoInstallAbstractGraph"/> is on (the default), asking only
+        /// about budget exhaustion. Calling it explicitly still has a use: with
+        /// <paramref name="exhaustionOnly"/> false it also installs where only the corridor clamp
+        /// is reachable, and a game that turned the automatic install off can pick the moment.
+        /// Installing moves the navigation fingerprint — the graph's checksum folds into
+        /// <see cref="GetNavFingerprint"/> and contributes zero when there is none — so a build with
+        /// a graph and one without are different builds, which is the point: the Ready exchange
+        /// catches the mismatch instead of letting peers walk different routes.</para>
+        ///
+        /// <para><b>Two exact conditions, and either is enough.</b> A* cannot pop more triangles
+        /// than exist and a corridor cannot be longer than one, so
+        /// <c>triangles &gt; <see cref="FPNavTuning.MaxIterations"/></c> is the exact necessary
+        /// condition for a search to run out of budget, and
+        /// <c>triangles &gt; <see cref="FPNavTuning.CorridorCap"/></c> the exact one for a path to
+        /// come back clamped. Both are read from the tuning this system runs on, not from the
+        /// constants — an instance handed a different tuning still compiles against those. Necessary
+        /// is not sufficient: past either line the failure becomes <i>reachable</i>, which is when a
+        /// graph starts earning its cost.</para>
+        ///
+        /// <para><b>The cell size is searched, not guessed.</b> Node width scales with cell size and
+        /// local triangle density, and density varies by an order of magnitude between assets, so no
+        /// fixed value is safe everywhere and any formula would carry a constant fitted to whatever
+        /// meshes it was measured on. Instead this derives at
+        /// <c><see cref="FPNavMesh.GridCellSize"/> * 16</c> and halves until the widest node fits
+        /// <see cref="FPNavTuning.CorridorCap"/>, taking the first that does — the largest node that
+        /// fits, so the graph has the fewest nodes it can. Deriving gets <i>cheaper</i> as cells grow,
+        /// so the ladder spends its cheap probes first. The rungs are powers of two on purpose:
+        /// <see cref="FPNavAbstractGraph.MaxNodeDiameter"/> is a lower bound off a tree, so landing
+        /// with room to spare is worth more than landing exactly on the cap.</para>
+        ///
+        /// <para><b>The search runs once, here.</b> A rebake re-derives the graph at the size this
+        /// chose (see <see cref="SwapNavMesh(FPNavMesh)"/>), so a swap pays one derivation rather
+        /// than another ladder.</para>
+        ///
+        /// <para><b>Never throws</b>, unlike <see cref="SetAbstractGraph"/> — a game wires this on
+        /// its initialization path, where an exception is a failed boot. Every refusal is a value.
+        /// Call it before the first tick, from the deterministic setup path, on every peer.</para>
+        ///
+        /// <para><b>What that rests on, since it is not obvious from here.</b> The method reads the
+        /// mesh this system was constructed with and never checks it for null — and does not need
+        /// to: <see cref="FPNavMeshQuery"/> and <see cref="FPNavMeshPathfinder"/> size their buffers
+        /// from <c>navMesh.Triangles.Length</c> in their constructors, so a system cannot be built
+        /// around a null mesh at all. <b>A peer with no navigation is a null SYSTEM, not a system
+        /// with a null mesh</b> — the engine's fingerprint path handles that with <c>?.</c> at the
+        /// call site, which is what the null branch in <see cref="GetNavFingerprint"/> is defending
+        /// rather than describing. The only other throw in reach is
+        /// <see cref="FPNavAbstractGraph"/>'s refusal of a non-positive cell size, and the ladder
+        /// returns <see cref="FPNavAbstractGraphInstall.NoCellSizeFits"/> as a value before it can
+        /// happen.</para>
+        ///
+        /// <para><b>Every outcome is logged, including the ones where nothing happens.</b> A game
+        /// reads this decision from its boot log, and a path that stays silent is one nobody can
+        /// tell apart from the call not having run — which is the failure mode this whole feature
+        /// exists to remove, one level up. The lines carry the numbers the decision was made from,
+        /// so <i>legs are off</i> can be checked rather than taken on faith.</para>
+        /// </summary>
+        /// <param name="cellSize">
+        /// The cell size the ladder settled on, or zero when nothing was installed. Hand this to
+        /// <see cref="FPNavAbstractGraph"/> to rebuild the identical graph — a tool that draws the
+        /// partition, or a peer that builds its own, needs the value and cannot re-derive it.
+        /// </param>
+        /// <param name="costFold">How per-node cost is folded; build identity, same on every peer.</param>
+        /// <param name="areaMask">The plan mask the graph is derived for; build identity.</param>
+        /// <param name="exhaustionOnly">
+        /// Ask only whether a flat search can run out of budget, not whether a corridor can come back
+        /// clamped. This is what the constructor's automatic install asks: the clamp is a
+        /// walk-and-replan the flat planner already handles, and counting it would put a graph on
+        /// every mesh past the corridor cap (128 triangles). The default, false, is the original
+        /// contract — either condition is enough.
+        /// </param>
+        public FPNavAbstractGraphInstall TryInstallAbstractGraphIfBeneficial(
+            out FP64 cellSize,
+            FPNavAbstractCostFold costFold = FPNavAbstractCostFold.Min,
+            int areaMask = DEFAULT_AREA_MASK,
+            bool exhaustionOnly = false)
+            => InstallAbstractGraphCore(out cellSize, costFold, areaMask, exhaustionOnly, automatic: false);
+
+        private bool _autoGraphReplacedLogged;
+
+        // The body of TryInstallAbstractGraphIfBeneficial. `automatic` is the constructor: it changes
+        // the words (so a boot log says which of the two did this) and one level — a mesh no cell
+        // size fits is an error to a game that asked for legs and a warning to one that got the
+        // default, because the default path must not fail a boot log for a mesh it merely cannot
+        // partition.
+        private FPNavAbstractGraphInstall InstallAbstractGraphCore(
+            out FP64 cellSize, FPNavAbstractCostFold costFold, int areaMask,
+            bool exhaustionOnly, bool automatic)
+        {
+            cellSize = FP64.Zero;
+            string who = automatic ? "planning in legs (automatic)" : "planning in legs";
+
+            // A game that picked its own cell size has already made this decision. Overwriting it
+            // would silently move that game's agents onto a different partition.
+            if (_abstractGraph != null)
+            {
+                _logger?.KInformation(
+                    $"[FPNavAgentSystem] {who}: already on and left alone — " +
+                    $"{_abstractGraph.NodeCount} nodes, widest node {_abstractGraph.MaxNodeDiameter} " +
+                    $"hops across ({_abstractGraph.MaxLegCorridorTriangles} corridor triangles). " +
+                    $"This helper does not overwrite a graph the game installed itself; " +
+                    $"its cell size is that game's choice and replacing it would move every agent " +
+                    $"onto a partition nobody picked.");
+                return FPNavAbstractGraphInstall.AlreadyInstalled;
+            }
+
+            int triangles = _navMesh.Triangles.Length;
+            bool canExhaust = triangles > _tuning.MaxIterations;
+            bool canClamp = !exhaustionOnly && triangles > _tuning.CorridorCap;
+            if (!canExhaust && !canClamp)
+            {
+                // The quiet answer, said out loud. This is the branch a small stage takes every
+                // boot, and leaving it silent makes "legs are off because the mesh does not need
+                // them" indistinguishable from "the call was never wired" — two states with very
+                // different fixes. The numbers are here so the margin can be read: a stage growing
+                // toward a cap shows it in this line before it crosses one. The automatic path says
+                // which condition it asked about, because it asks about one fewer than an explicit
+                // call does.
+                // KLogger takes an interpolated-string handler: a ternary between two literals is
+                // a plain string and binds to the ref overload (CS1620), so pick the text first.
+                string notNeeded = exhaustionOnly
+                    ? $"[FPNavAgentSystem] {who}: off — not needed. {triangles} triangles is within " +
+                      $"the search budget ({_tuning.MaxIterations}), so a flat search cannot run out on " +
+                      $"this mesh and a graph would move the navigation fingerprint for nothing " +
+                      $"(the corridor cap {_tuning.CorridorCap} is not asked about here — a clamped " +
+                      $"corridor is walked and re-planned, not failed)."
+                    : $"[FPNavAgentSystem] {who}: off — not needed. {triangles} triangles " +
+                      $"is within both the corridor cap ({_tuning.CorridorCap}) and the search budget " +
+                      $"({_tuning.MaxIterations}), so neither failure is reachable on this mesh and a " +
+                      $"graph would move the navigation fingerprint for nothing.";
+                _logger?.KInformation($"{notNeeded}");
+                return FPNavAbstractGraphInstall.NotNeeded;
+            }
+
+            FP64 floor = _navMesh.GridCellSize;
+            if (floor <= FP64.Zero)
+            {
+                _logger?.KError(
+                    $"[FPNavAgentSystem] TryInstallAbstractGraphIfBeneficial: the mesh has no " +
+                    $"broadphase cell size, so there is no ladder to walk. Install a graph by hand " +
+                    $"with a cell size you measured, or leave legs off.");
+                return FPNavAbstractGraphInstall.NoCellSizeFits;
+            }
+
+            FP64 candidate = floor * FP64.FromInt(LEG_CELL_LADDER_START_MULTIPLE);
+            FP64 two = FP64.FromInt(2);
+            FPNavAbstractGraph chosen = null;
+            int probes = 0;
+
+            while (true)
+            {
+                var graph = new FPNavAbstractGraph(_navMesh, candidate, costFold, areaMask, _logger);
+                probes++;
+
+                if (graph.MaxLegCorridorTriangles <= _tuning.CorridorCap)
+                {
+                    chosen = graph;
+                    break;
+                }
+
+                if (candidate <= floor)
+                    break;
+
+                candidate = candidate / two;
+                if (candidate < floor)
+                    candidate = floor;
+            }
+
+            if (chosen == null)
+            {
+                string noFit =
+                    $"[FPNavAgentSystem] {who}: no cell size fits. " +
+                    $"Down to the mesh's own broadphase cell ({floor.ToDouble():F2}) the widest node " +
+                    $"still spans more than the corridor cap {_tuning.CorridorCap}, so every leg " +
+                    $"would come back clamped. This mesh plans flat; " +
+                    $"DebugIterationExhaustedCount says whether that costs anything.";
+                // An error to a game that asked for legs, a warning to one that got the default:
+                // the automatic path must not put an error in the boot log of a mesh it merely
+                // cannot partition.
+                if (automatic) _logger?.KWarning($"{noFit}"); else _logger?.KError($"{noFit}");
+                return FPNavAbstractGraphInstall.NoCellSizeFits;
+            }
+
+            // Through the same door a hand-wired install uses, so the mesh-identity and cap
+            // invariants have one implementation. Neither can throw from here: the graph was
+            // derived against _navMesh, and the ladder only stops on a diameter within the cap.
+            SetAbstractGraph(chosen);
+            cellSize = candidate;
+
+            // Which threshold was true, not just that one was — the prescription is the same but
+            // the diagnosis is not, and the next person to read this log needs the difference.
+            string why = canExhaust
+                ? $"{triangles} triangles is past the iteration budget {_tuning.MaxIterations}, so a " +
+                  $"flat search can run out before it decides" +
+                  (canClamp ? $" (and past the corridor cap {_tuning.CorridorCap})" : "")
+                : $"{triangles} triangles is past the corridor cap {_tuning.CorridorCap}, so a flat " +
+                  $"path can come back clamped (the iteration budget {_tuning.MaxIterations} is not " +
+                  $"reachable on this mesh)";
+
+            _logger?.KInformation(
+                $"[FPNavAgentSystem] {who} at cell {candidate.ToDouble():F2} " +
+                $"({probes} derivation(s) on the ladder from {floor.ToDouble():F2} x " +
+                $"{LEG_CELL_LADDER_START_MULTIPLE}): {chosen.NodeCount} nodes, {chosen.EdgeCount} " +
+                $"edges, widest node {chosen.MaxNodeDiameter} hops across " +
+                $"({chosen.MaxLegCorridorTriangles} corridor triangles) against cap " +
+                $"{_tuning.CorridorCap}. {why}. Navigation fingerprint is now " +
+                $"0x{GetNavFingerprint():X16} — replays recorded without a graph will refuse.");
+
+            return FPNavAbstractGraphInstall.Installed;
+        }
+
+        private int _abstractSearchFailedCount;
+        private int _legResolveFailedCount;
+        private int _legAdvanceCount;
+
+        /// <summary>
+        /// Diagnostic: node routes the abstract search could not find. <b>This is a failure the leg
+        /// planner introduces</b>, and it does not reach
+        /// <see cref="FPNavMeshPathfinder.DebugIterationExhaustedCount"/> — that counter belongs to
+        /// the triangle search, which never runs when the abstract one gives up first. Reading only
+        /// that one would show a clean budget while every unit stands still.
+        /// </summary>
+        public int DebugAbstractSearchFailedCount => _abstractSearchFailedCount;
+
+        /// <summary>
+        /// Diagnostic: legs the abstract search chose that the real A* then could not solve. Two
+        /// unrelated defects surface here — an abstract cost on a different scale than the real one,
+        /// and a node that claims a crossing the mesh does not have — and neither shows as a desync,
+        /// because every peer computes the same wrong route. The agent falls back to planning
+        /// straight at its destination, so a rising count is a correctness signal, not a stall.
+        /// </summary>
+        public int DebugLegResolveFailedCount => _legResolveFailedCount;
+
+        /// <summary>Diagnostic: legs completed and handed on to the next one.</summary>
+        public int DebugLegAdvanceCount => _legAdvanceCount;
+
+        private int _legAdvanceRepeatCount;
+
+        /// <summary>
+        /// Diagnostic: plans that asked for the crossing the agent had just finished, and were sent
+        /// on to the next one instead. Reaching a portal does not put the agent past it — the portal
+        /// IS the shared edge — so the node it stands in has not changed yet and the abstract search
+        /// would otherwise hand back the same hop.
+        ///
+        /// <para>Expect roughly one per leg: it is the normal cost of a boundary being a line rather
+        /// than a region. What it must NOT do is stay at zero while <see cref="DebugLegAdvanceCount"/>
+        /// runs several times the number of nodes on the route — that was the shape of the defect
+        /// this replaced, where the agent circled at each boundary until it drifted across.</para>
+        /// </summary>
+        public int DebugLegAdvanceRepeatCount => _legAdvanceRepeatCount;
+
+        private int _legEndedOnPlanTickCount;
+        private bool _legReachRadiusWarned;
+
+        /// <summary>
+        /// Diagnostic: legs that ended on the very tick they were planned — the agent was already
+        /// inside <c>ReachRadius</c> of its leg target when the plan was made, so it travelled
+        /// nothing before the hand-off sent it back to the planner.
+        ///
+        /// <para><b>This is the counter that says the reach radius is too wide for the node.</b>
+        /// The radius is <c>v² / a</c>, the tightest arc the agent can hold, and nothing bounds it
+        /// against the graph's <see cref="FPNavAbstractGraph.CellSize"/>. Once it exceeds a node's
+        /// width every leg target is "reached" the moment it is chosen, and because the hand-off
+        /// clears <c>LastRepathTick</c> to bypass the repath cooldown, the agent runs a full A*
+        /// every tick — the opposite of what planning in legs is for.</para>
+        ///
+        /// <para><b>Read it as a rate, and do not read
+        /// <see cref="DebugLegAdvanceRepeatCount"/> for this.</b> That one rises about once per leg
+        /// in healthy operation AND about once per leg here, so its ratio to
+        /// <see cref="DebugLegAdvanceCount"/> is 1:1 either way and separates nothing. This one is
+        /// near zero when legs are working — a leg that takes even one tick to walk does not land
+        /// here — and approaches one per agent per tick when the radius has swallowed the node.</para>
+        ///
+        /// <para>An occasional count is not a defect: a portal can genuinely be a step away.</para>
+        /// </summary>
+        public int DebugLegEndedOnPlanTickCount => _legEndedOnPlanTickCount;
+
+        private int _partialHandoffCount;
+
+        /// <summary>
+        /// Diagnostic: times an agent reached the end of a PARTIAL corridor and was handed back to
+        /// the planner (<see cref="FPNavTuning.PartialPathOnExhaustion"/>). The hand-off is the leg
+        /// hand-off — the same code, the same reach radius — and with no abstract graph installed
+        /// every hand-off is one of these, so this count is exact there. <b>With a graph installed
+        /// the two cannot be told apart at the hand-off</b> (nothing in the frame says which kind
+        /// of target <c>PathTarget</c> is, and adding a field would change the wire), so partial
+        /// ends are then counted in <see cref="DebugLegAdvanceCount"/> instead; the pathfinder's
+        /// <c>DebugPartialPathCount</c> stays exact either way, counting them where they are made.
+        /// </summary>
+        public int DebugPartialHandoffCount => _partialHandoffCount;
+
+        private int _partialEndedOnPlanTickCount;
+
+        /// <summary>
+        /// Diagnostic: partial corridors whose end was already inside <c>ReachRadius</c> on the tick
+        /// they were planned — the twin of <see cref="DebugLegEndedOnPlanTickCount"/> for the
+        /// no-graph hand-off, and exact only there (with a graph the hand-off cannot tell a partial
+        /// end from a portal). The best node can never sit inside the radius (its progress is at
+        /// least the reach radius, and progress cannot exceed distance), so this counts only ends
+        /// that the corridor cap moved: a chain that doubled back toward the agent and was clipped
+        /// where it passed close by. Each count is one full-budget search spent on a hop that moved
+        /// nothing, and because the hand-off clears the repath cooldown they arrive in bursts, one per
+        /// tick, until the agent's own motion carries the clipped end out of the radius.
+        /// </summary>
+        public int DebugPartialEndedOnPlanTickCount => _partialEndedOnPlanTickCount;
+
+        private int _maskFallbackCount;
+
+        /// <summary>
+        /// Diagnostic: plans that skipped the abstract graph because the agent's resolved plan mask
+        /// is not the one the graph was derived under. Those agents keep the flat path — correct,
+        /// but they also keep the cost the leg planner exists to remove, so this is the ratio that
+        /// says whether a per-mask graph would earn its memory. An agent whose override happens to
+        /// resolve to the graph's own mask does NOT land here; only a genuinely different mask does,
+        /// so a game whose agents all plan under the mask its graph was built for never moves it.
+        /// </summary>
+        public int DebugMaskFallbackCount => _maskFallbackCount;
+
+        /// <summary>
+        /// What the last leg resolution actually produced. Two of these mean the search that
+        /// follows is short or shortened; the rest mean it is flat and runs the whole way to the
+        /// destination — which is the search that can run out of budget.
+        /// </summary>
+        private enum LegPlanKind : byte
+        {
+            /// <summary>The hierarchy handed back a portal: the search is one leg long.</summary>
+            Legs = 0,
+
+            /// <summary>Start and goal share a node. Nothing to shorten, and nothing far.</summary>
+            SameNode = 1,
+
+            /// <summary>No graph installed at all — the case this whole feature is opt-in about.</summary>
+            NoGraph = 2,
+
+            /// <summary>A graph is installed, but this agent plans under a mask it was not derived for.</summary>
+            MaskMismatch = 3,
+
+            /// <summary>The agent's own triangle could not be found, so no node could be either.</summary>
+            StartOffMesh = 4,
+
+            /// <summary>The destination is not on the mesh under this agent's plan mask.</summary>
+            GoalOffMesh = 5,
+
+            /// <summary>Both triangles resolved, but the graph does not name a node for one of them.</summary>
+            NodeUnknown = 6,
+
+            /// <summary>The abstract search found no route between the two nodes.</summary>
+            NoAbstractRoute = 7,
+
+            /// <summary>Legs planned a portal the triangle search could not reach, so this fell back.</summary>
+            AbstractRouteUnreachable = 8,
+        }
+
+        private LegPlanKind _lastLegPlanKind;
+
+        /// <summary>
+        /// True when the search about to run is flat and goes the whole way to the destination —
+        /// <b>not</b> simply "no graph installed". A graph can be present and still not shorten this
+        /// particular search, and those are precisely the plans that keep the failure the graph was
+        /// installed to remove while looking, from the outside, like a healthy leg-planning build.
+        /// </summary>
+        private static bool PlansFlatToDestination(LegPlanKind kind)
+            => kind != LegPlanKind.Legs && kind != LegPlanKind.SameNode;
+
+        private int _exhaustedWithoutLegsCount;
+        private bool _exhaustedWithoutLegsWarned;
+
+        /// <summary>
+        /// Diagnostic: searches that ran out of <see cref="FPNavTuning.MaxIterations"/> while the
+        /// hierarchy was not shortening them. <b>The conjunction is the point.</b>
+        /// <see cref="FPNavMeshPathfinder.DebugIterationExhaustedCount"/> on its own counts every
+        /// budget overrun including the ones inside a leg, and neither counter alone says the thing
+        /// a reader needs: <i>this agent stopped, and nothing was making its search local</i>.
+        ///
+        /// <para>This exists because that fact was already knowable and nobody read it. The budget
+        /// counter was rising, correctly, through an entire session of units standing still — it
+        /// took opening the visualizer to notice. A value is not a signal until something says what
+        /// it means.</para>
+        ///
+        /// <para><b>Not proof that a route exists.</b> Exhaustion means the search stopped before it
+        /// decided, not that it would have succeeded with more budget. See the one-time warning for
+        /// the wording that keeps this honest.</para>
+        /// </summary>
+        public int DebugExhaustedWithoutLegsCount => _exhaustedWithoutLegsCount;
+
+        /// <summary>
+        /// Called after the plan's searches, with the budget counter as it stood before them and
+        /// what the plan ended with. Warns once per system, then counts silently — a per-tick line
+        /// from eight hundred agents buries the thing it is trying to say.
+        ///
+        /// <para>The outcome is passed in rather than read off the pathfinder: the delta can span
+        /// two searches (a leg that exhausted, then the flat retry), and the pathfinder's
+        /// last-call flags describe only the second. The retry can find a whole path; saying "no
+        /// path" there was the one thing the line got wrong.</para>
+        /// </summary>
+        private void NoteExhaustionWithoutLegs(int exhaustedBefore, bool found, bool partial)
+        {
+            if (_pathfinder.DebugIterationExhaustedCount == exhaustedBefore)
+                return;
+            if (!PlansFlatToDestination(_lastLegPlanKind))
+                return;
+
+            _exhaustedWithoutLegsCount++;
+            if (_exhaustedWithoutLegsWarned)
+                return;
+            _exhaustedWithoutLegsWarned = true;
+
+            // Deliberately not "turn legs on and this is fixed". Exhaustion says the search stopped
+            // before it decided; it does not say a route was there to find. What is true is the
+            // mechanism: the budget is per search, and a leg is a shorter search.
+            // No graph has two very different causes since legs turned on by default (0.13): the
+            // automatic install is off in this tuning, or it is on and found no cell size that fits
+            // (the boot log says which — NotNeeded cannot be it, because a mesh within the budget
+            // cannot exhaust). "Wire the one-line helper" is only the prescription for the first.
+            string what = _lastLegPlanKind == LegPlanKind.NoGraph
+                ? (_tuning.AutoInstallAbstractGraph
+                    ? $"no abstract graph is installed on this system — the automatic install is on, " +
+                      $"so either no cell size fit this mesh (see the boot log) or the game removed it"
+                    : $"no abstract graph is installed on this system — the automatic install is off " +
+                      $"in this tuning (FPNavTuning.AutoInstallAbstractGraph)")
+                : $"an abstract graph is installed but this plan did not use it ({_lastLegPlanKind})";
+
+            // What the unit ended with changes what it does about it, not the diagnosis: the
+            // search still stopped before it decided, and legs are still the way to make it not.
+            // Three outcomes, not two: a whole path can follow an exhaustion when the flat retry
+            // after an exhausted leg search finds one, or when the goal was already in the open set
+            // as the budget ran out (PartialPathOnExhaustion hands that back whole).
+            string outcome = !found
+                ? $"The unit got no path. "
+                : partial
+                    ? $"The unit got a PARTIAL corridor (PartialPathOnExhaustion) and will walk to the " +
+                      $"closest point the search reached, then plan again from there. "
+                    : $"The unit got a whole path anyway (the goal was already in hand when the budget " +
+                      $"ran out, or a flat retry after an exhausted leg search found it). ";
+
+            _logger?.KWarning(
+                $"[FPNavAgentSystem] a path search ran out of its {_tuning.MaxIterations}-triangle " +
+                $"budget on a {_navMesh.Triangles.Length}-triangle mesh, and {what}. The search " +
+                $"stopped before it decided — that is not the same as there being no route. {outcome}" +
+                $"Planning in legs makes each search local rather than raising the budget; " +
+                $"it is on by default, TryInstallAbstractGraphIfBeneficial is the explicit form, " +
+                $"and either moves this game's navigation fingerprint. Further occurrences are " +
+                $"counted in DebugExhaustedWithoutLegsCount, not logged.");
         }
 
         /// <summary>
@@ -410,6 +1174,48 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         }
 
         /// <summary>
+        /// Takes the graph <see cref="PrepareAbstractGraphFor"/> built, if it is genuinely the one
+        /// this swap needs. Returns false — and costs nothing but two comparisons — otherwise.
+        ///
+        /// <para><b>Two checks, and neither is redundant.</b></para>
+        /// <list type="number">
+        /// <item><b>The same INSTANCE.</b> <see cref="SetAbstractGraph"/> enforces
+        /// <c>ReferenceEquals(graph.CurrentMesh, _navMesh)</c> as an invariant — node ids index one
+        /// mesh's triangles — so a graph derived from an identical-but-separate mesh is not
+        /// installable no matter how equal its contents are. Identity is required, not preferred.</item>
+        /// <item><b>The same CONTENT.</b> Identity alone is not enough in the other direction: the
+        /// rebake driver pools meshes and <c>CommitSwap</c> retires the one it replaces, so a
+        /// reference can be recycled and rewritten. Adopting on identity alone would then install a
+        /// graph indexing geometry that is no longer there — and every peer would do it identically,
+        /// so the state hash would agree and nothing would report it. The fingerprint is a fold over
+        /// the mesh; against a 10 ms derivation it is free.</item>
+        /// </list>
+        ///
+        /// <para>On adoption the outgoing graph becomes the spare, so the pair alternates and no
+        /// allocation happens after the first prepare.</para>
+        /// </summary>
+        private bool TryAdoptPreparedGraph(FPNavMesh newMesh)
+        {
+            if (_spareGraph == null || _preparedMesh == null)
+                return false;
+
+            if (!ReferenceEquals(_preparedMesh, newMesh)
+                || unchecked((long)FPNavMeshRebaker.ComputeFingerprint(newMesh)) != _preparedFingerprint)
+            {
+                // Held, not dropped: the mesh it was built for may still be the one that arrives.
+                _graphPreparedMissedCount++;
+                return false;
+            }
+
+            FPNavAbstractGraph outgoing = _abstractGraph;
+            _abstractGraph = _spareGraph;
+            _spareGraph = outgoing;
+            _preparedMesh = null;
+            _graphPreparedAdoptedCount++;
+            return true;
+        }
+
+        /// <summary>
         /// The part of a swap that is the same whichever way the trio got bound: adopt the mesh,
         /// drop the graph-local CSR, re-extract obstacles, and say so. Shared so the two
         /// overloads cannot drift — a swap that skipped any of this would be observably different.
@@ -417,6 +1223,76 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         private void InstallSwappedMesh(FPNavMesh newMesh)
         {
             _navMesh = newMesh;
+
+            // The abstract graph is derived from the mesh, so a swap invalidates it wholesale.
+            // Agents mid-leg are handed back to the planner by ReseedAgents, which clears HasPath.
+            if (_abstractGraph != null)
+            {
+                // Adopted or derived, the graph that comes out of here is the same one — that is
+                // the whole safety argument for preparing ahead, and the reason the cap check below
+                // sits outside this branch rather than inside either arm of it.
+                if (!TryAdoptPreparedGraph(newMesh))
+                {
+                    // The whole derivation, on the deterministic command path. Measured at 10.15 ms
+                    // on the Field asset at the cell size the install ladder picks (Release),
+                    // against the ~2 ms that time-slicing the rebake itself works to stay inside —
+                    // roughly five times the budget it lands in. Timing it is opt-in; counting is
+                    // not.
+                    long startTicks = DebugTimeGraphDerivation
+                        ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
+                    _abstractGraph.Rebind(newMesh);
+                    _graphRederiveCount++;
+
+                    // Once per system: the swap just paid a whole derivation on the deterministic
+                    // command path because nothing prepared one ahead. With legs on by default this
+                    // is the path a large-mesh game with runtime rebakes lands on unless it wires
+                    // PrepareAbstractGraphFor — a cost of wall clock, not of determinism (the graph
+                    // is the same either way), which is why this is a warning and not an error.
+                    if (!_prepareWarned)
+                    {
+                        _prepareWarned = true;
+                        _logger?.KWarning(
+                            $"[FPNavAgentSystem] a navmesh swap re-derived the abstract graph on the " +
+                            $"deterministic command path ({newMesh.Triangles.Length} triangles at cell " +
+                            $"{_abstractGraph.CellSize.ToDouble():F2}) because no graph was prepared for " +
+                            $"this mesh ahead of the swap. The result is identical either way; the cost " +
+                            $"is the tick that commits the rebake, which a sliced rebake exists to keep " +
+                            $"small. Call PrepareAbstractGraphFor(mesh) from the rebake's off-tick path " +
+                            $"before committing, and the swap adopts it for free. Said once; " +
+                            $"DebugGraphRederiveCount counts the rest.");
+                    }
+
+                    if (DebugTimeGraphDerivation)
+                    {
+                        double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks)
+                            * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                        _logger?.KInformation(
+                            $"[FPNavAgentSystem] abstract graph re-derived on the swap in " +
+                            $"{ms:F2} ms at cell {_abstractGraph.CellSize.ToDouble():F2} " +
+                            $"({_abstractGraph.NodeCount} nodes, {_abstractGraph.EdgeCount} edges, " +
+                            $"{newMesh.Triangles.Length} triangles) — swap #{_graphRederiveCount}. " +
+                            $"This runs on the deterministic command path, inside the tick budget a " +
+                            $"sliced rebake exists to protect. PrepareAbstractGraphFor moves it off.");
+                    }
+                }
+
+                // SetAbstractGraph refuses a graph whose widest node exceeds the corridor cap, but a
+                // rebake can widen one AFTER that check passed: carving merges walkable regions that
+                // the base mesh kept apart. Throwing here is not on the table — this runs inside a
+                // swap, on the deterministic command path — so it is reported and the run continues
+                // with the same clamping the flat planner had. DebugCorridorTruncatedCount is what
+                // shows the cost while the log says why.
+                if (_abstractGraph.MaxLegCorridorTriangles > _tuning.CorridorCap)
+                {
+                    _logger?.KError(
+                        $"[FPNavAgentSystem] after the swap a leg through the widest node can ask " +
+                        $"for {_abstractGraph.MaxLegCorridorTriangles} triangles against a corridor cap of " +
+                        $"{_tuning.CorridorCap}. The rebake widened a node past what SetAbstractGraph " +
+                        $"accepted, so legs through it come back clamped. Derive with a smaller cell " +
+                        $"size, or stop installing a graph for this stage.");
+                }
+            }
 
             // Invalidate the graph-local obstacle CSR; LoadNavMeshObstacles rebuilds it (and the
             // BFS stamp sizing + radius inset) from the new mesh when avoidance is wired.
@@ -570,6 +1446,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// this returned before tuning entered — an existing replay is not refused by a feature that
         /// changed no behaviour.</para>
         ///
+        /// <para><b>And the partial-path switch</b>, as its own term
+        /// (<see cref="FPNavTuning.PartialPathDigest"/>, zero when off) rather than inside the tuning
+        /// digest — the same shape as the abstract graph below, and for the same reason: a switch
+        /// nobody turned on must not move anybody's fingerprint, and a knob appended to the digest's
+        /// fold would move every custom tuning's.</para>
+        ///
         /// <para><b>0 stays "no mesh".</b> The revision is folded INSIDE the null check on purpose:
         /// <c>KlothoEngine.FingerprintsDiffer</c> reads 0 as "not provided" and must keep doing so,
         /// or a peer with no navigation at all would be reported as a mismatch against one that has
@@ -583,8 +1465,27 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             long fp = unchecked((long)FPNavMeshRebaker.ComputeFingerprint(_navMesh));
             fp = unchecked(fp ^ (NAV_BEHAVIOUR_REVISION * NAV_REVISION_MIXER));
             fp = unchecked(fp ^ _tuning.Digest);
+            fp = unchecked(fp ^ _tuning.PartialPathDigest);
+            fp = unchecked(fp ^ AbstractGraphDigest());
             return fp == 0 ? 1L : fp;
         }
+
+        /// <summary>
+        /// The abstract graph's contribution to the fingerprint — <b>0 when there is no graph</b>,
+        /// the same normalisation <see cref="FPNavTuning.Digest"/> uses for its default.
+        ///
+        /// <para>This is what makes the leg planner a fingerprint concern rather than a revision
+        /// one. Planning in legs is opt-in and its off switch is exact — with no graph installed
+        /// the agent system plans the flat path it always did — so bumping
+        /// <see cref="NAV_BEHAVIOUR_REVISION"/> would refuse every recorded replay for a feature
+        /// nobody turned on. That is precisely what the digest normalisation above exists to
+        /// prevent. What DOES have to be caught is two peers disagreeing about the graph: one with
+        /// legs on and one without, or two with different cell sizes. The graph's own checksum
+        /// answers all of those in one value, because it already folds its parameters along with
+        /// the shape they produced.</para>
+        /// </summary>
+        private long AbstractGraphDigest()
+            => _abstractGraph == null ? 0L : unchecked((long)_abstractGraph.Checksum);
 
         /// <summary>
         /// Number of obstacle vertices currently loaded into the avoidance (0 if no avoidance).
@@ -689,7 +1590,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             for (int i = 0; i < entityCount; i++)
             {
                 ref var nav = ref frame.Get<NavAgentComponent>(entities[i]);
-                ProcessMovement(ref nav, dt);
+                ProcessMovement(ref nav, dt, currentTick);
             }
 
             // Pass 4: position-based collision resolution.
@@ -820,6 +1721,153 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             return d;
         }
 
+        /// <summary>
+        /// How close counts as "there" for the point the agent is currently steering at.
+        ///
+        /// <para>For the destination this is <see cref="WaypointThreshold"/> — arriving means
+        /// arriving. For a LEG it is the agent's turning radius, <c>v² / a</c>, because that is the
+        /// tightest arc it can hold at its present speed: a portal it must turn at cannot be reached
+        /// within a smaller radius than that no matter how the steering is written, and an agent
+        /// asked to do it circles the point instead of passing through.</para>
+        ///
+        /// <para>Handing off early is not a loss of precision. The leg planner's job is to keep the
+        /// SEARCH local, not to march the unit through a series of gates — and
+        /// <see cref="ResolveLegTarget"/> uses the same radius to notice that the crossing it was
+        /// handed is the one just made, so an early hand-off turns into a longer lookahead rather
+        /// than a repeat.</para>
+        /// </summary>
+        private FP64 ReachRadius(in NavAgentComponent nav)
+        {
+            if (nav.PathTarget == nav.Destination)
+                return WaypointThreshold;
+            return HandoffRadius(nav.CurrentSpeed, nav.Acceleration, WaypointThreshold);
+        }
+
+        /// <summary>
+        /// Where THIS leg aims. Without an abstract graph that is always the destination, which is
+        /// what makes the off switch exact. With one, it is the portal onto the next node — the
+        /// agent walks there, the corridor runs out, and the planner is asked again.
+        ///
+        /// <para>Falling back to the destination is always safe: it is the flat plan, and every
+        /// reason to fall back (no graph, an unlocalised agent, endpoints in one node) is a case
+        /// where legs would buy nothing anyway.</para>
+        /// </summary>
+        private FPVector3 ResolveLegTarget(ref NavAgentComponent nav)
+        {
+            if (_abstractGraph == null)
+            {
+                _lastLegPlanKind = LegPlanKind.NoGraph;
+                return nav.Destination;
+            }
+
+            // D-5 (c) — the safety net. The graph was derived for ONE mask, so an agent planning
+            // under a different one could be promised crossings that mask forbids. Such agents take
+            // the flat path: always right, and no worse than they had before legs existed. How many
+            // land here is the number that decides whether per-mask graphs are worth building (the
+            // plan's D-5 (a)) — hence the counter rather than a silent branch.
+            //
+            // The test is the RESOLVED mask against the graph's, not "does an override exist". The
+            // older form asked the latter, which is a proxy: an override that resolves to the same
+            // mask the graph was derived under is safe, and refusing it cost the agent legs for no
+            // reason. It also made an explicit SetAreaMask(nav, DEFAULT_AREA_MASK, ...) — the most
+            // natural way to say "use the default" — silently opt that agent out of the graph while
+            // changing nothing else about it.
+            //
+            // Equality is deliberately narrower than the exact safety condition, which is the
+            // SUBSET one: the graph's walkable set is contained in the agent's iff every bit of the
+            // graph's mask is in the agent's, i.e. (graphMask & ~planMask) == 0. Under that rule a
+            // DEFAULT_AREA_MASK graph would also serve an ALL_AREAS agent — legally, but the graph
+            // does not know the retained footprints that agent may cross, so it would route around
+            // them. That is a detour only that agent pays and nothing reports, so the narrower
+            // rule is chosen on optimality, not on correctness. Widening it to the subset test is
+            // a behaviour change, not a cleanup.
+            if (FPNavAgentSystem.ResolvePlanMask(nav) != _abstractGraph.AreaMask)
+            {
+                _maskFallbackCount++;
+                _lastLegPlanKind = LegPlanKind.MaskMismatch;
+                return nav.Destination;
+            }
+
+            int startTri = nav.CurrentTriangleIndex >= 0
+                ? nav.CurrentTriangleIndex
+                : _query.FindTriangle(nav.Position.ToXZ(), nav.Position.y);
+            if (startTri < 0)
+            {
+                _lastLegPlanKind = LegPlanKind.StartOffMesh;
+                return nav.Destination;
+            }
+
+            int goalTri = _query.FindTriangleForEndpoint(
+                nav.Destination.ToXZ(), nav.Destination.y, ResolvePlanMask(nav));
+            if (goalTri < 0)
+            {
+                _lastLegPlanKind = LegPlanKind.GoalOffMesh;
+                return nav.Destination;
+            }
+
+            int startNode = _abstractGraph.NodeOf(startTri);
+            int goalNode = _abstractGraph.NodeOf(goalTri);
+            // Split, because the two halves mean opposite things. A node the graph cannot name is
+            // the same trouble as an endpoint off the mesh — the search that follows is flat and
+            // full-distance. Start and goal sharing a node is the opposite: the hierarchy has
+            // nothing to shorten because there is nothing far to shorten. Folded together, the
+            // second would have masked the first in every diagnostic that reads this.
+            if (startNode < 0 || goalNode < 0)
+            {
+                _lastLegPlanKind = LegPlanKind.NodeUnknown;
+                return nav.Destination;
+            }
+            if (startNode == goalNode)
+            {
+                _lastLegPlanKind = LegPlanKind.SameNode;   // last leg — nothing the graph can say
+                return nav.Destination;
+            }
+
+            // The agent's position and the real destination go INTO the search, standing in for the
+            // two node centres at the ends of the route. Without them the first portal is chosen
+            // from a point the agent is not at — and an agent that just changed legs is on its
+            // node's boundary, about as far from that centre as it gets.
+            if (!_abstractGraph.TryFindFirstHop(
+                    startNode, goalNode, nav.Position.ToXZ(), nav.Destination.ToXZ(),
+                    out int edge, out int nextEdge))
+            {
+                // No node route at all. The triangle search never runs, so its budget counter stays
+                // clean — this is the only place the failure is visible.
+                _abstractSearchFailedCount++;
+                _lastLegPlanKind = LegPlanKind.NoAbstractRoute;
+                return nav.Destination;
+            }
+
+            // Aim ACROSS the portal rather than at its middle. What to aim through it at is the
+            // portal after this one when there is one, and the destination when this hop is the
+            // last: the destination can point clean out of the next node, and steering at it would
+            // hug a corner the route then has to come back around.
+            FPVector2 beyond = nextEdge >= 0
+                ? _abstractGraph.EdgePortal(nextEdge).ToXZ()
+                : nav.Destination.ToXZ();
+            FPVector3 aim = _abstractGraph.AimPointOn(edge, nav.Position.ToXZ(), beyond);
+
+            // The crossing we have ALREADY made. A leg ends when the agent reaches its portal, but
+            // the triangle it stands on at that moment is still on the near side of the boundary —
+            // the portal is the shared edge, and arriving at it does not put the agent past it. The
+            // abstract search then starts from the same node and hands back the same crossing, whose
+            // aim point is where the agent is standing, so the leg ends again on the next tick. The
+            // hand-off keeps the agent's velocity, so this does not stall: it circles.
+            //
+            // Measured before this guard: 66 leg advances over a route that changes node 17 times —
+            // 49 of them repeats in a node the agent had not left. Aiming at what comes AFTER the
+            // crossing is what carries it through.
+            _lastLegPlanKind = LegPlanKind.Legs;
+            if (FPVector2.Distance(nav.Position.ToXZ(), aim.ToXZ()) < ReachRadius(nav))
+            {
+                _legAdvanceRepeatCount++;
+                return nextEdge >= 0
+                    ? _abstractGraph.AimPointOn(nextEdge, nav.Position.ToXZ(), nav.Destination.ToXZ())
+                    : nav.Destination;
+            }
+            return aim;
+        }
+
         private unsafe void ProcessPathRequest(ref NavAgentComponent nav, int currentTick)
         {
             if (!nav.HasNavDestination || nav.HasPath)
@@ -846,8 +1894,32 @@ namespace xpTURN.Klotho.Deterministic.Navigation
 
             nav.LastRepathTick = currentTick;
 
-            bool found = _pathfinder.FindPath(nav.Position, nav.Destination, ResolvePlanMask(nav),
-                out int[] corridor, out int corridorLength);
+            FPVector3 legTarget = ResolveLegTarget(ref nav);
+
+            int exhaustedBefore = _pathfinder.DebugIterationExhaustedCount;
+            FP64 partialMinProgress = PartialMinProgress(in nav, WaypointThreshold);
+            bool found = _pathfinder.FindPath(nav.Position, legTarget, ResolvePlanMask(nav),
+                partialMinProgress, out int[] corridor, out int corridorLength,
+                out bool partial, out FPVector3 partialEnd);
+
+            if (!found && legTarget != nav.Destination)
+            {
+                // The abstract route picked a portal the real search cannot reach. Two defects look
+                // identical here (a cost scale the triangle search disagrees with, and a node that
+                // claims a crossing the mesh does not have) and neither is a desync, so it is
+                // counted rather than swallowed. Falling straight back to the destination keeps the
+                // agent moving on the flat path it would have had without any of this.
+                _legResolveFailedCount++;
+                // The retry is flat and goes the whole way, so from here on this plan is one of the
+                // ones the signal is about — a graph is installed and is not shortening this search.
+                _lastLegPlanKind = LegPlanKind.AbstractRouteUnreachable;
+                legTarget = nav.Destination;
+                found = _pathfinder.FindPath(nav.Position, legTarget, ResolvePlanMask(nav),
+                    partialMinProgress, out corridor, out corridorLength, out partial, out partialEnd);
+            }
+
+            NoteExhaustionWithoutLegs(exhaustedBefore, found, partial);
+
             if (found)
             {
                 fixed (int* dst = nav.Corridor)
@@ -855,7 +1927,11 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                     _corridorCopyTruncatedCount += NavCorridorHelper.SetCorridor(
                         dst, ref nav.CorridorLength, _tuning.CorridorCap, corridor, corridorLength);
                 }
-                nav.PathTarget = nav.Destination;
+                // A partial corridor ends short of what it was planned toward, so the agent aims
+                // at ITS end: that is what makes the leg hand-off below treat arriving there as
+                // "re-plan", not "arrived". Nothing else marks the corridor as partial — the frame
+                // does not need to know, and a field for it would change the wire.
+                nav.PathTarget = partial ? partialEnd : legTarget;
                 nav.PathId = nav.PathRequestId;
                 nav.PathIsValid = true;
                 nav.HasPath = true;
@@ -917,7 +1993,10 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             FPVector2 direction = (cornerXZ - posXZ).normalized;
             nav.DesiredVelocity = direction * nav.Speed;
 
-            FPVector2 targetXZ = nav.PathTarget.ToXZ();
+            // Slowing down measures to the DESTINATION, not to this leg's end. With legs on, the
+            // leg end is a portal the agent passes through at speed; braking for it would put a
+            // stutter at every node boundary — silent, because nothing fails, the units just crawl.
+            FPVector2 targetXZ = nav.Destination.ToXZ();
             FP64 distToTarget = FPVector2.Distance(posXZ, targetXZ);
 
             if (nav.Acceleration > FP64.Zero)
@@ -931,7 +2010,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
 
             if (nav.StoppingDistance > FP64.Zero)
             {
-                FP64 yDist = FP64.Abs(nav.Position.y - nav.PathTarget.y);
+                FP64 yDist = FP64.Abs(nav.Position.y - nav.Destination.y);
                 if (yDist < MultiFloorYThreshold)
                 {
                     if (distToTarget < nav.StoppingDistance)
@@ -942,7 +2021,42 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             }
         }
 
-        private unsafe void ProcessMovement(ref NavAgentComponent nav, FP64 dt)
+        /// <summary>
+        /// Says once, per system, that an agent's reach radius is wider than a node — the condition
+        /// behind <see cref="DebugLegEndedOnPlanTickCount"/>. Latched because the state it reports
+        /// is a TUNING mismatch that holds for the whole run: repeating it every tick would bury
+        /// the log of the match it is trying to explain.
+        ///
+        /// <para>It cannot be checked at install time. The radius is <c>v² / a</c> off the agent's
+        /// CURRENT speed, and the ceiling <c>Speed² / Acceleration</c> lives per entity in the
+        /// frame — <see cref="SetAbstractGraph"/> knows the cell size but not who will walk on it.
+        /// So the check rides the one place both numbers are in hand.</para>
+        ///
+        /// <para>Diagnostic only: the latch is instance state, never frame state, and nothing here
+        /// changes what any agent does.</para>
+        /// </summary>
+        private void WarnLegReachRadiusOnce(in NavAgentComponent nav)
+        {
+            if (_legReachRadiusWarned || _abstractGraph == null || _logger == null)
+                return;
+
+            FP64 radius = ReachRadius(in nav);
+            FP64 cell = _abstractGraph.CellSize;
+            if (radius <= cell)
+                return; // a portal that was genuinely a step away; the radius is not the problem
+
+            _legReachRadiusWarned = true;
+            _logger.KWarning(
+                $"[FPNavAgentSystem] planning in legs: an agent's reach radius " +
+                $"{radius.ToDouble():F2} is wider than a node ({_abstractGraph.CellSize.ToDouble():F2}), " +
+                $"so its leg targets are reached on the tick they are planned and it re-plans every " +
+                $"tick instead of once per leg. The radius is speed² / acceleration " +
+                $"({nav.CurrentSpeed.ToDouble():F2}² / {nav.Acceleration.ToDouble():F2}) — lower the " +
+                $"speed, raise the acceleration, or derive the graph with a larger cell. " +
+                $"DebugLegEndedOnPlanTickCount counts how often this happens; said once per system.");
+        }
+
+        private unsafe void ProcessMovement(ref NavAgentComponent nav, FP64 dt, int currentTick)
         {
             if (nav.Status != (byte)FPNavAgentStatus.Moving)
             {
@@ -1105,11 +2219,68 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                 FP64 distToTarget = FPVector2.Distance(
                     nav.Position.ToXZ(), nav.PathTarget.ToXZ());
                 FP64 yDistToTarget = FP64.Abs(nav.Position.y - nav.PathTarget.y);
-                if (distToTarget < WaypointThreshold && yDistToTarget < MultiFloorYThreshold)
+                // A leg hands off from FURTHER OUT than the destination does, and the distance is
+                // physical rather than chosen: an agent moving at v with acceleration a cannot hold
+                // an arc tighter than v²/a, so asking it to pass within WaypointThreshold of a
+                // portal it has to turn at is asking for something it cannot do. It orbits instead —
+                // measured on a switchback fixture at 346 ticks spent inside 3 units of a leg target
+                // against 36 for a straight pass, and that circling is what a user sees at a node.
+                //
+                // The destination keeps the tight threshold: arriving there means arriving.
+                if (distToTarget < ReachRadius(nav) && yDistToTarget < MultiFloorYThreshold)
                 {
-                    nav.Status = (byte)FPNavAgentStatus.Arrived;
-                    nav.Velocity = FPVector2.Zero;
-                    nav.DesiredVelocity = FPVector2.Zero;
+                    if (nav.PathTarget == nav.Destination)
+                    {
+                        nav.Status = (byte)FPNavAgentStatus.Arrived;
+                        nav.Velocity = FPVector2.Zero;
+                        nav.DesiredVelocity = FPVector2.Zero;
+                    }
+                    else
+                    {
+                        // A leg ended, not the journey. Hand the agent back to the planner without
+                        // touching its velocity — stopping here is exactly the stutter the braking
+                        // change above avoids.
+                        //
+                        // LastRepathTick goes back to the "never planned" sentinel on purpose: the
+                        // repath cooldown exists to stop an agent replanning its DESTINATION every
+                        // tick, and applying it to a leg hand-off would park the unit at every
+                        // portal for the length of the cooldown.
+                        //
+                        // Without a graph, a PathTarget that is not the destination can only be the
+                        // end of a partial corridor, so that case is counted as what it is. With a
+                        // graph the hand-off cannot tell the two apart (see
+                        // DebugPartialHandoffCount) and counts as a leg advance.
+                        if (_abstractGraph == null)
+                        {
+                            _partialHandoffCount++;
+                            // Same test as the leg branch below, same meaning: planned in pass 1
+                            // and handed off in pass 3 of this Update, so nothing was walked.
+                            if (nav.LastRepathTick == currentTick)
+                                _partialEndedOnPlanTickCount++;
+                        }
+                        else
+                        {
+                            _legAdvanceCount++;
+
+                            // Did this leg travel at all? Planning runs in pass 1 and this hand-off
+                            // in pass 3 of the same Update, so LastRepathTick still holds the tick
+                            // the leg was planned on. Equal to the current tick means the agent was
+                            // already within ReachRadius when the target was chosen — nothing moved,
+                            // and the cleared cooldown below sends it straight back to a full A*.
+                            if (nav.LastRepathTick == currentTick)
+                            {
+                                _legEndedOnPlanTickCount++;
+                                WarnLegReachRadiusOnce(in nav);
+                            }
+                        }
+
+                        nav.HasPath = false;
+                        nav.PathIsValid = false;
+                        nav.CorridorLength = 0;
+                        nav.OffCorridorTicks = 0;
+                        nav.LastRepathTick = 0;
+                        nav.Status = (byte)FPNavAgentStatus.PathPending;
+                    }
                 }
             }
         }

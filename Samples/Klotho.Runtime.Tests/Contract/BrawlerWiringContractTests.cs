@@ -235,5 +235,38 @@ namespace xpTURN.Klotho.Runtime.Tests.Contract
             Assert.IsTrue(Regex.IsMatch(bots, @"StandsInsideBuilding\(int[\s\S]{0,400}?FPNavMeshAreas\.BUILDING_MASK"),
                 "StandsInsideBuilding no longer reads the installed mesh's building stamp");
         }
+
+        /// <summary>
+        /// <b>The leg-planning decision is the engine's, not a condition written out here.</b>
+        ///
+        /// <para>This is a regex about an absence, which is the shape a regex is actually good for.
+        /// The behaviour — Brawler's stages get no graph — is covered by
+        /// <c>FPNavAbstractGraphInstallTests</c> against the same assets; what a behaviour test
+        /// cannot catch is the sample growing its own copy of the condition back, and the copy that
+        /// stood here for months read the wrong cap: it tested <c>MAX_CORRIDOR</c>, the clamp
+        /// condition, while the failure that strands units is budget exhaustion at
+        /// <c>MAX_ITERATIONS</c>. A stage between 128 and 4096 triangles would have been told it
+        /// needed legs when it did not, and one past 4096 was the case nobody was checking.</para>
+        ///
+        /// <para>It also hard-coded a cell size measured on one asset. Both belong where the tuning
+        /// actually in effect can be read, which is not here.</para>
+        /// </summary>
+        [Test]
+        public void LegPlanning_IsDelegatedToTheEngine_NotReDerivedInTheSample()
+        {
+            string src = ReadBrawler("Manager/BrawlerSimulationCallbacks.cs");
+
+            Assert.IsTrue(Regex.IsMatch(src, @"TryInstallAbstractGraphIfBeneficial\s*\("),
+                "the sample no longer goes through the engine helper — whatever replaced it has to "
+                + "answer both thresholds from the tuning in effect, which is what the helper is for");
+
+            Assert.IsFalse(Regex.IsMatch(src, @"new\s+FPNavAbstractGraph\s*\("),
+                "the sample builds its own graph again, which means it also picked a cell size — "
+                + "the value that was hard-coded from one asset and is now searched per mesh");
+
+            Assert.IsFalse(Regex.IsMatch(src, @"triangles\s*<=\s*FPNavMeshPathfinder\.MAX_CORRIDOR"),
+                "the wrong-cap condition is back: MAX_CORRIDOR is the corridor clamp, not budget "
+                + "exhaustion, and exhaustion is the failure that leaves units standing still");
+        }
     }
 }

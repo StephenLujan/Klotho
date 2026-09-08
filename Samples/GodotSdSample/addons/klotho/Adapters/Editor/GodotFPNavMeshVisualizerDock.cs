@@ -19,10 +19,25 @@ namespace xpTURN.Klotho.Godot
 
         private LineEdit _pathEdit;
         private Label _counts;
+        private Label _flatRisk;
+        private SpinBox _budgetSpin;
+        private Label _tuningNote;
+        private Button _reloadTuningBtn;
         private Label _pathInfo;
         private Label _tick;
         private Label _agentList;
         private Label _destRefusal;
+        private Label _legState;
+        private Label _legStats;
+        private Label _legStatus;
+        private Label _navCounters;
+        // The node-partition toggle. Held because the overlay is the SINGLE source of truth for it
+        // and a retained control is a second copy: ClearAbstractGraph turns ShowNodes off behind
+        // the dock's back, and a checkbox that only remembers what the user last clicked then says
+        // the partition is on while nothing is drawn. Refresh pushes the overlay's value back, the
+        // same way PushSpin does for the two knobs the simulator writes. Unity's IMGUI has no such
+        // field because it re-reads _overlay.ShowNodes every repaint — that is why it is immune.
+        private CheckBox _showNodesChk;
         private Label _hoverCell;
         private Label _triInfo;
         private Button _playBtn;
@@ -121,15 +136,40 @@ namespace xpTURN.Klotho.Godot
                     $"Vertices: {data.NavMesh.Vertices.Length}\n" +
                     $"Triangles: {data.NavMesh.Triangles.Length}\n" +
                     $"Grid: {data.NavMesh.GridWidth} x {data.NavMesh.GridHeight} (cell {data.NavMesh.GridCellSize.ToFloat():F1})\n" +
-                    $"Blocked: {blocked}   Boundary: {data.BoundaryEdges.Count}   Internal: {data.InternalEdges.Count}";
+                    $"Blocked: {blocked}   Boundary: {data.BoundaryEdges.Count}   Internal: {data.InternalEdges.Count}\n" +
+                    $"Tuning: budget {data.ToolTuning.MaxIterations}, partial paths {(data.ToolTuning.PartialPathOnExhaustion ? "on" : "off")}, auto legs {(data.ToolTuning.AutoInstallAbstractGraph ? "on" : "off")}";
+                // Input differs from what is loaded: say so, and offer the reload that applies it.
+                bool tuningStale = !data.ToolTuning.Equals(_ctrl.ToolTuningInput);
+                _tuningNote.Text = tuningStale
+                    ? $"Loaded with budget {data.ToolTuning.MaxIterations}, partial paths {(data.ToolTuning.PartialPathOnExhaustion ? "on" : "off")}, auto legs {(data.ToolTuning.AutoInstallAbstractGraph ? "on" : "off")}. Reload to apply (agents, placements and the leg graph are cleared)."
+                    : "";
+                _tuningNote.Visible = tuningStale;
+                _reloadTuningBtn.Visible = tuningStale;
+
+                // Only while legs are off: with a graph installed the reader has already answered
+                // it. The budget line is the one that strands units, so it gets the warning sign;
+                // past only the corridor cap the cost is route quality, and marking every mesh over
+                // 128 triangles would teach the reader to ignore this before it ever mattered.
+                string risk = null;
+                bool canExhaust = false;
+                if (sim.AbstractGraph == null)
+                    risk = sim.DescribeFlatPlanningRisk(out canExhaust);
+
+                _flatRisk.Visible = !string.IsNullOrEmpty(risk);
+                _flatRisk.Text = string.IsNullOrEmpty(risk)
+                    ? ""
+                    : $"{(canExhaust ? "\u26A0" : "\u2139")} {risk}";
             }
             else
             {
                 _counts.Text = "(not loaded)";
+                _flatRisk.Visible = false;
+                _tuningNote.Visible = false;
+                _reloadTuningBtn.Visible = false;
             }
 
             _pathInfo.Text = data.HasPath
-                ? $"Path: OK   Corridor: {data.CorridorLength}   Waypoints: {data.WaypointCount}"
+                ? $"Path: {(data.PathIsPartial ? "PARTIAL (budget ran out — stops short of the end)" : "OK")}   Corridor: {data.CorridorLength}   Waypoints: {data.WaypointCount}"
                 : $"Start: {(data.HasStart ? Fmt(data.StartPoint) : "-")}   End: {(data.HasEnd ? Fmt(data.EndPoint) : "-")}";
 
             _tick.Text = $"Tick: {sim.CurrentTick}";
@@ -154,7 +194,12 @@ namespace xpTURN.Klotho.Godot
                         + $"/{GodotFPNavMeshVisualizer.MaskLabel(rd.walkAreaMask)}]";
                     // WHY it failed, judged against the mesh as it is now — separate from the
                     // destination refusal below (that one says the click was refused).
-                    string why = FPNavPathFailure.Describe(rd.failureReason);
+                    // Same sentence the warning gets, from the same helper — the list and the log
+                    // must not drift into describing one state two ways.
+                    string why = rd.failureReason == FPNavPathFailureReason.None
+                        ? ""
+                        : " <- " + GodotFPNavMeshAgentSimulator.ExplainFailure(
+                            rd.failureReason, rd.failedKind, sim.PartialPathsOn);
                     string sel = _ctrl.Interaction?.SelectedAgentIndex == i ? "▸" : " ";
                     sb.Append($"{sel}#{i}: {rd.status}{extra}{masks}{why} {Fmt(rd.position)}\n");
                 }
@@ -167,6 +212,8 @@ namespace xpTURN.Klotho.Godot
 
             _destRefusal.Text = string.IsNullOrEmpty(sim.LastDestinationRefusal)
                 ? "" : $"⚠ {sim.LastDestinationRefusal}";
+
+            RefreshLegPlanning();
 
             // Info (selected or hovered triangle)
             int idx = it.SelectedTriangleIndex >= 0 ? it.SelectedTriangleIndex : it.HoveredTriangleIndex;
@@ -212,8 +259,35 @@ namespace xpTURN.Klotho.Godot
             row.AddChild(Btn("Unload", () => _ctrl.Unload()));
             AddChild(row);
 
+            // Tuning for the NEXT load; applying is reloading (the stack holds the tuning it was
+            // built with — see the controller). Without these nothing in the editor could make a
+            // mesh exhaust its budget or show a partial path.
+            var budgetRow = SpinRow("Budget", _ctrl.ToolMaxIterations, v => _ctrl.ToolMaxIterations = (int)v, out _budgetSpin);
+            _budgetSpin.MinValue = 1; _budgetSpin.MaxValue = 1_000_000; _budgetSpin.Step = 1; _budgetSpin.Value = _ctrl.ToolMaxIterations;
+            AddChild(budgetRow);
+            AddChild(Check("partial paths on exhaustion", _ctrl.ToolPartialPaths, v => _ctrl.ToolPartialPaths = v));
+            AddChild(Check("auto legs (graph on a mesh past the budget)", _ctrl.ToolAutoLegs, v => _ctrl.ToolAutoLegs = v));
+            _tuningNote = new Label { AutowrapMode = TextServer.AutowrapMode.Word, CustomMinimumSize = new Vector2(260, 0), Visible = false };
+            AddChild(_tuningNote);
+            _reloadTuningBtn = Btn("Reload with this tuning", () => _ctrl.ReloadWithTuning());
+            _reloadTuningBtn.Visible = false;
+            AddChild(_reloadTuningBtn);
+
             _counts = Lbl();
             AddChild(_counts);
+
+            // Beside the mesh's own numbers, because that is what it is a fact about — the first
+            // version sat down in the leg block, which you reach only if you already went looking.
+            // Width pinned and wrapping allowed, the same exception _placementUnsupportedLbl makes:
+            // the text is a sentence with no newlines of its own, and an unpinned label that long
+            // would push the dock column wide.
+            _flatRisk = new Label
+            {
+                AutowrapMode = TextServer.AutowrapMode.Word,
+                CustomMinimumSize = new Vector2(260, 0),
+                Visible = false,
+            };
+            AddChild(_flatRisk);
             AddChild(new HSeparator());
         }
 
@@ -447,6 +521,8 @@ namespace xpTURN.Klotho.Godot
             // the same field, so both engines refuse in the same shape.
             _destRefusal = Lbl();
             AddChild(_destRefusal);
+
+            BuildLegPlanningControls();
             AddChild(new HSeparator());
         }
 
@@ -486,6 +562,127 @@ namespace xpTURN.Klotho.Godot
         {
             var it = _ctrl.Interaction;
             it.Mode = it.Mode == mode ? InteractionMode.None : mode;
+        }
+
+        /// <summary>
+        /// Planning in legs. Inside the agent section on purpose: the abstract graph belongs to the
+        /// agent system, and the Pathfinding section's Find Path goes straight to the pathfinder and
+        /// is unaffected. A switch at the top of the dock would read as global and then look broken
+        /// when Find Path ignored it. Mirrors the Unity window.
+        /// </summary>
+        private void BuildLegPlanningControls()
+        {
+            AddChild(new HSeparator());
+            _legState = Lbl();
+            AddChild(_legState);
+
+            // Derivation runs on the button, never on these edits — 12.6 ms on the Field asset at
+            // cell 16, and Refresh is called from eighteen places.
+            AddChild(SpinRow("Cell size", _ctrl.LegCellSize, v => _ctrl.LegCellSize = (float)v));
+            AddChild(Check("Cost fold: Mean (else Min)", _ctrl.LegCostFold == FPNavAbstractCostFold.Mean,
+                v => _ctrl.LegCostFold = v ? FPNavAbstractCostFold.Mean : FPNavAbstractCostFold.Min));
+            // The mask the graph is DERIVED under. An agent whose resolved plan mask differs from it
+            // falls back to the flat path and is counted; matching them is how that disappears.
+            AddChild(Check("Derive for: all areas (else agent default)", _ctrl.LegGraphMaskAllAreas,
+                v => _ctrl.LegGraphMaskAllAreas = v));
+
+            var legRow = new HBoxContainer();
+            legRow.AddChild(Btn("Apply legs", () => _ctrl.ApplyAbstractGraph()));
+            legRow.AddChild(Btn("Clear legs", () => _ctrl.ClearAbstractGraph()));
+            AddChild(legRow);
+
+            // Colours the triangle fill by node instead of by area, and outlines node boundaries.
+            // The initial value is the overlay's, not a literal — Refresh keeps it that way.
+            _showNodesChk = Check("Show node partition (colours the triangle fill)",
+                _ctrl.Overlay != null && _ctrl.Overlay.ShowNodes, v =>
+            {
+                var ov = _ctrl.Overlay;
+                ov.ShowNodes = v;
+                ov.AbstractGraph = _ctrl.AgentSim?.AbstractGraph;
+                _ctrl.RequestStaticRedraw();
+                _ctrl.RequestDynamicRedraw();
+            });
+            AddChild(_showNodesChk);
+
+            _legStats = Lbl();
+            AddChild(_legStats);
+            _legStatus = Lbl();
+            AddChild(_legStatus);
+
+            AddChild(Header("Nav counters (since load)"));
+            _navCounters = Lbl();
+            AddChild(_navCounters);
+        }
+
+        /// <summary>
+        /// The leg block's live text. Split out of <see cref="Refresh"/> only for length; it runs
+        /// on every refresh like the rest.
+        /// </summary>
+        private void RefreshLegPlanning()
+        {
+            var sim = _ctrl.AgentSim;
+            var graph = sim?.AbstractGraph;
+
+            // The overlay owns this, so read it back rather than trusting what the user last
+            // clicked — PushGraphToOverlay clears ShowNodes whenever the graph goes away. No
+            // _seen guard, unlike PushSpin: a checkbox has no half-typed state to fight.
+            if (_showNodesChk != null && _ctrl.Overlay != null)
+                _showNodesChk.SetPressedNoSignal(_ctrl.Overlay.ShowNodes);
+
+            _legState.Text = graph == null ? "Planning in legs — off"
+                : sim.AbstractGraphIsAutomatic ? "Planning in legs — ON (automatic)"
+                : "Planning in legs — ON";
+
+            if (graph != null)
+            {
+                // NodeCount is the number that says whether legs can do anything here at all: one
+                // node means every plan already ends inside it, so the route is the flat one and
+                // that is correct rather than broken.
+                _legStats.Text =
+                    $"{graph.NodeCount} nodes, {graph.EdgeCount} edges, "
+                    + $"widest node {graph.MaxNodeDiameter} hops -> up to "
+                    + $"{graph.MaxLegCorridorTriangles} corridor tris (cap {sim.CorridorCap})\n"
+                    + $"checksum 0x{graph.Checksum:X16} — folded into the nav fingerprint"
+                    + (graph.NodeCount <= 1
+                        ? "\none node: every route ends inside it, so legs change nothing here" : "");
+            }
+            else
+            {
+                // One line, because the notice itself is up beside the triangle count. Repeating
+                // it here would be the same sentence in two places.
+                string legRisk = null;
+                bool legExhaust = false;
+                if (sim != null)
+                    legRisk = sim.DescribeFlatPlanningRisk(out legExhaust);
+
+                _legStats.Text = string.IsNullOrEmpty(legRisk)
+                    ? ""
+                    : (legExhaust
+                        ? "this mesh can exhaust a flat search — see the mesh counts above"
+                        : "this mesh can clamp a flat corridor — see the mesh counts above");
+            }
+
+            _legStatus.Text = string.IsNullOrEmpty(_ctrl.LegStatus) ? "" : $"⚠ {_ctrl.LegStatus}";
+
+            var c = sim != null ? sim.ReadNavCounters() : default;
+            _navCounters.Text =
+                $"legs advanced {c.legAdvance}   abstract search failed {c.abstractSearchFailed}"
+                + $"   leg unsolvable {c.legResolveFailed}\n"
+                // A rate against "legs advanced" beside it, not a total — see the Unity window.
+                + $"legs that ended on the tick they were planned {c.legEndedOnPlanTick}"
+                + (c.legEndedOnPlanTick > 0 && c.legEndedOnPlanTick >= c.legAdvance
+                    ? "   <-- every leg; the reach radius is wider than a node" : "") + "\n"
+                + $"mask fallback {c.maskFallback}   corridor copy truncated {c.corridorCopyTruncated}\n"
+                // Split out and labelled: these two live on the pathfinder, which the Find Path
+                // button shares with the agents. Pressing it moves them with no agent involved.
+                + $"pathfinder (shared with Find Path) — corridor clamped {c.corridorTruncated}"
+                + $"   budget exhausted {c.iterationExhausted}\n"
+                // The conjunction, kept apart from the raw budget count above it. That one includes
+                // overruns INSIDE a leg, where the hierarchy is working and the budget is simply
+                // small; this one only counts searches nothing was shortening. A graph being
+                // installed does not zero it — a differently masked agent still plans flat.
+                + $"exhausted with nothing shortening the search {c.exhaustedWithoutLegs}"
+                + (c.exhaustedWithoutLegs > 0 ? "   <-- legs would make these local" : "");
         }
 
         private static Label Header(string text)

@@ -23,6 +23,20 @@ namespace xpTURN.Klotho.Editor
         public bool ShowBlockedTriangles = true;
         public bool ShowCostHeatmap;
 
+        /// <summary>
+        /// Colour the triangle fill by abstract node instead of by area, and outline where one node
+        /// ends and the next begins. Off by default: it replaces the fill that says blocked/building,
+        /// so it is a lens you reach for, not the normal view.
+        /// </summary>
+        public bool ShowNodes;
+
+        /// <summary>
+        /// The graph to colour by, or null. Set by the window from the simulator — the overlay does
+        /// NOT derive its own: a second derivation could disagree with the one the agents plan
+        /// against, and the only symptom would be a picture that is quietly wrong.
+        /// </summary>
+        public FPNavAbstractGraph AbstractGraph;
+
         // Path layer
         public bool ShowCorridor = true;
         public bool ShowWaypoints = true;
@@ -102,6 +116,9 @@ namespace xpTURN.Klotho.Editor
             if (ShowCostHeatmap)
                 DrawCostHeatmap();
 
+            if (ShowNodes && AbstractGraph != null)
+                DrawNodeBoundaries();
+
             if (ShowGrid)
                 DrawGrid();
 
@@ -140,6 +157,12 @@ namespace xpTURN.Klotho.Editor
 
         private void DrawTriangles()
         {
+            // Node colouring is a MODE of this fill, not a pass of its own. The cost heatmap is a
+            // second full sweep drawn on top, which is affordable on a test mesh and is not on the
+            // Field asset: 22,321 triangles, no culling, every repaint. Choosing a colour here
+            // costs nothing extra.
+            var graph = ShowNodes ? AbstractGraph : null;
+
             for (int i = 0; i < _data.CachedTriangles.Length; i++)
             {
                 ref TriangleRenderData tri = ref _data.CachedTriangles[i];
@@ -148,6 +171,16 @@ namespace xpTURN.Klotho.Editor
                     Handles.color = FPNavMeshVisualizerStyles.TriangleFillBlocked;
                 else if (tri.isBlocked)
                     continue;
+                else if (graph != null)
+                {
+                    // -1 is "no node claims this triangle" — masked out or blocked — and it must NOT
+                    // share a colour with node 0, or ground the graph cannot route through reads as
+                    // ordinary walkable surface.
+                    int node = graph.NodeOf(i);
+                    Handles.color = node < 0
+                        ? FPNavMeshVisualizerStyles.TriangleFillOutsideGraph
+                        : FPNavMeshVisualizerStyles.NodeFill(node);
+                }
                 // Equality, not a bit test: the rebaker stamps a retained footprint EXCLUSIVELY
                 // (see FPNavMeshAreas), so a triangle carrying the bit alongside a baked area is
                 // not something this build produces — and shading it as a building would be a
@@ -261,6 +294,63 @@ namespace xpTURN.Klotho.Editor
             {
                 Handles.DotHandleCap(0, _data.CachedTriangles[i].center, Quaternion.identity,
                     0.05f, EventType.Repaint);
+            }
+        }
+
+        /// <summary>
+        /// Where one node ends and the next begins — every mesh edge whose two triangles belong to
+        /// different nodes. That set is EXACTLY the abstract graph's portals: an abstract edge is
+        /// "two triangles that are mesh neighbours in different nodes", with no folding and no
+        /// chosen representative, so nothing here is an approximation of what the planner uses.
+        ///
+        /// <para>Derived from the mesh rather than read out of the graph because the graph exposes
+        /// one accessor by design (<c>NodeOf</c>) and this needs nothing more. What it deliberately
+        /// does NOT reconstruct is edge COST: that would be a second copy of a formula, and a copy
+        /// that drifts would show a wrong number with nothing to contradict it.</para>
+        ///
+        /// <para><c>_data.InternalEdges</c> is not the source: it holds vertex pairs and not the
+        /// triangles they came from, so it cannot say which side belongs to which node.</para>
+        /// </summary>
+        private void DrawNodeBoundaries()
+        {
+            var mesh = _data.NavMesh;
+            var graph = AbstractGraph;
+
+            for (int t = 0; t < mesh.Triangles.Length; t++)
+            {
+                int a = graph.NodeOf(t);
+                if (a < 0) continue;
+
+                ref readonly FPNavMeshTriangle tri = ref mesh.Triangles[t];
+                for (int e = 0; e < 3; e++)
+                {
+                    int nb = tri.GetNeighbor(e);
+                    if (nb < 0) continue;
+                    // Each shared edge between two IN-GRAPH triangles is visited from both sides;
+                    // draw it once, from the lower index, so the line is not overdrawn (and so the
+                    // two directed edges the graph holds map to one stroke).
+                    //
+                    // A RIM edge is exempt, and the exemption is what makes the rim complete. Its
+                    // outer triangle is dropped by the `a < 0` continue above, so the edge is
+                    // reached from the in-graph side ONLY — deduping it there dropped every rim
+                    // edge whose outside neighbour happened to have the lower index, which is about
+                    // half of them, with nothing to say they were missing.
+                    if (nb < t && graph.NodeOf(nb) >= 0) continue;
+
+                    int b = graph.NodeOf(nb);
+                    // b < 0 is the graph's OUTER RIM, not a node boundary: the neighbour is masked
+                    // out or blocked. Different meaning, different colour — merging them would draw
+                    // a portal where the planner has none.
+                    if (b == a) continue;
+
+                    tri.GetEdgeVertices(e, out int va, out int vb);
+                    Handles.color = b < 0
+                        ? FPNavMeshVisualizerStyles.GraphRimLine
+                        : FPNavMeshVisualizerStyles.NodeBoundaryLine;
+                    Handles.DrawLine(
+                        mesh.Vertices[va].ToVector3(), mesh.Vertices[vb].ToVector3(),
+                        FPNavMeshVisualizerStyles.NodeBoundaryLineWidth);
+                }
             }
         }
 
@@ -469,6 +559,17 @@ namespace xpTURN.Klotho.Editor
                     Handles.SphereHandleCap(0, rd.destination, Quaternion.identity,
                         0.15f, EventType.Repaint);
                 }
+
+                // Where THIS leg ends, drawn only when it is not the destination — which is exactly
+                // when a graph is steering. Without it the counters say legs are being taken and
+                // nothing on screen shows where, so this is the picture that matches the number.
+                if (ShowNodes && rd.hasPath && rd.pathTarget != rd.destination)
+                {
+                    Handles.color = FPNavMeshVisualizerStyles.LegTargetMarker;
+                    Handles.DrawLine(rd.position, rd.pathTarget, 1.5f);
+                    Handles.DotHandleCap(0, rd.pathTarget, Quaternion.identity,
+                        FPNavMeshVisualizerStyles.LegTargetMarkerSize, EventType.Repaint);
+                }
             }
         }
 
@@ -658,12 +759,18 @@ namespace xpTURN.Klotho.Editor
             FPNavMeshQuery query = bridge.NavQuery;
             if (mesh == null || query == null) return;
 
-            // Recreate Pathfinder/Funnel if the NavMesh has changed
+            // Recreate Pathfinder/Funnel if the NavMesh has changed — with the GAME's tuning, read
+            // off the bridge's query. This reconstructs the route a live agent would take, and a
+            // default-tuned stack does not: a game that raised or lowered its budget, or turned
+            // partial paths on, gets a different corridor here than its agents got, and where the
+            // default budget runs out this drew the "no path" straight line under a unit that was
+            // walking a partial. The query is the game's already; the pathfinder and funnel were
+            // the odd ones out.
             if (_runtimeNavMeshRef != mesh)
             {
                 _runtimeNavMeshRef = mesh;
-                _runtimePathfinder = new FPNavMeshPathfinder(mesh, query, null);
-                _runtimeFunnel = new FPNavMeshFunnel(mesh, query, null);
+                _runtimePathfinder = new FPNavMeshPathfinder(mesh, query, null, query.Tuning);
+                _runtimeFunnel = new FPNavMeshFunnel(mesh, query, null, query.Tuning);
             }
 
             FPVector3 start = snap.Position;
@@ -673,8 +780,10 @@ namespace xpTURN.Klotho.Editor
             // the two stopped being the same value: ~0 admits a retained building footprint while
             // the agent's mask refuses it, so ~0 here would draw a path through a building the
             // agent will never enter — a wrong answer wearing the agent's label.
-            if (!_runtimePathfinder.FindPath(start, end, FPNavAgentSystem.DEFAULT_AREA_MASK,
-                    out int[] corridor, out int corridorLength))
+            // Zero minimum progress, like the Find Path tool: the agent's own minimum is its reach
+            // radius, and this drawing only asks what ground the search reached.
+            if (!_runtimePathfinder.FindPath(start, end, FPNavAgentSystem.DEFAULT_AREA_MASK, FP64.Zero,
+                    out int[] corridor, out int corridorLength, out bool partial, out FPVector3 partialEnd))
             {
                 // No path found — fallback to straight line
                 Handles.color = new Color(
@@ -685,7 +794,9 @@ namespace xpTURN.Klotho.Editor
                 return;
             }
 
-            _runtimeFunnel.Funnel(corridor, corridorLength, start, end,
+            // Toward the corridor's actual end: a partial's last triangle, not the destination —
+            // see FPNavMeshVisualizerData.FindPath for why the funnel must not be handed the goal.
+            _runtimeFunnel.Funnel(corridor, corridorLength, start, partial ? partialEnd : end,
                 out FPVector3[] waypoints, out int waypointCount);
 
             if (waypointCount < 1) return;
