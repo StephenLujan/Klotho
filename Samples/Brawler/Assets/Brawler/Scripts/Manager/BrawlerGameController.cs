@@ -176,7 +176,7 @@ namespace Brawler
         // only when SD lobby is enabled at runtime (see builder block); null otherwise.
         private SdLobbyIssueProvider _identityProvider;
 
-        private string _replayPath = GetUserDataPath("Replays/brawler.rply");
+        private string _replayPath;
 
         /// <summary>
         /// Resolves a user-data path (replays and the like) uniformly across platforms. The root differs
@@ -221,6 +221,7 @@ namespace Brawler
         private void Awake()
         {
             DontDestroyOnLoad(gameObject);
+            _replayPath = GetUserDataPath("Replays/brawler.rply");
             CreateLogger();
 
             // Driver per-frame hook wired here so it is live even when Start() returns early via

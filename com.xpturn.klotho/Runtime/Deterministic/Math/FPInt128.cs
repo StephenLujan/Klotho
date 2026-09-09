@@ -46,27 +46,38 @@ namespace xpTURN.Klotho.Deterministic.Math
             ulong ua = (ulong)(a < 0 ? -a : a);
             ulong ub = (ulong)(b < 0 ? -b : b);
 
-            // Schoolbook 32-bit split: exact unsigned 64x64 -> 128.
-            ulong aLo = ua & 0xFFFFFFFFUL;
-            ulong aHi = ua >> 32;
-            ulong bLo = ub & 0xFFFFFFFFUL;
-            ulong bHi = ub >> 32;
-
-            ulong ll = aLo * bLo;
-            ulong lh = aLo * bHi;
-            ulong hl = aHi * bLo;
-            ulong hh = aHi * bHi;
-
-            // mid = lh + hl contributes at bit offset 32; its 64-bit wraparound is worth 2^96.
-            ulong mid = lh + hl;
-            ulong midCarry = mid < lh ? 1UL << 32 : 0UL;
-
-            ulong lo = ll + (mid << 32);
-            ulong loCarry = lo < ll ? 1UL : 0UL;
-            ulong hi = hh + (mid >> 32) + midCarry + loCarry;
-
+            ulong hi = MulUnsigned(ua, ub, out ulong lo);
             var magnitude = new FPInt128((long)hi, lo);
             return negative ? Negate(magnitude) : magnitude;
+        }
+
+        /// <summary>
+        /// Exact unsigned 64x64 -> 128; returns the high word and writes the low one. The
+        /// intrinsic where the host has one, a 32-bit schoolbook split elsewhere — the same
+        /// integer either way, so peers on different hosts agree bit for bit.
+        ///
+        /// <para>This is the ONE such split in the engine. <see cref="Mul64"/> signs it, and the
+        /// abstract graph's quotient comparison reads it raw; a second copy would be a second code
+        /// path to audit, with the domain assert and the BigInteger oracle on only one of them.</para>
+        /// </summary>
+        internal static ulong MulUnsigned(ulong a, ulong b, out ulong lo)
+        {
+#if NET5_0_OR_GREATER
+            return System.Math.BigMul(a, b, out lo);
+#else
+            return MulUnsignedByHalves(a, b, out lo);
+#endif
+        }
+
+        /// <summary>The halves alone, so a test can hold them against the intrinsic on a host that
+        /// has one — see <c>Mul64_MatchesTheIntrinsic</c>.</summary>
+        internal static ulong MulUnsignedByHalves(ulong a, ulong b, out ulong lo)
+        {
+            ulong aLo = (uint)a, aHi = a >> 32, bLo = (uint)b, bHi = b >> 32;
+            ulong ll = aLo * bLo, lh = aLo * bHi, hl = aHi * bLo, hh = aHi * bHi;
+            ulong mid = (ll >> 32) + (uint)lh + (uint)hl;
+            lo = (mid << 32) | (uint)ll;
+            return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
         }
 
         public static FPInt128 Add(FPInt128 a, FPInt128 b)

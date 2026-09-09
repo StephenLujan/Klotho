@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.14.0] - 2026-09-09
+
+### Changed — a hop is costed boundary to boundary, so a long route no longer drifts off the straight line
+
+- **What it is.** 0.13.0 added planning in legs: instead of one huge search to a far destination, the
+  walkable surface is cut into **nodes**, a route through those nodes is picked first, and the real
+  A\* solves only the next leg. That route was costed from the *centre* of one node to the centre of
+  the next, and that is where a leftover detour came from — a path running at an angle to the grid
+  walked 6–10% further than the straight line, however far it went.
+
+  A hop is now costed from **the boundary a unit enters a node by to the boundary it leaves by** —
+  think of them as the doorways of a room. It is the straight distance between the two when the way
+  across is clear, and the length of the way *around* when something is in between. And the node a
+  route enters is chosen by the best estimate of the whole remaining trip *through* it, rather than
+  by whichever boundary is nearest.
+
+- **What you get.** Measured on the same routes: the middle of a route is now **1.000× its straight
+  line at cell 16 and 1.002× at cell 32**, at every distance — it was 1.06–1.10×. A 27° route across
+  a 48-cell test field went from 1.062× to **0.997×**. Ground that is expensive to cross (a band of
+  swamp) is charged to the node it actually lies in instead of to its neighbour. Where a route turns
+  a corner of the grid, a unit is now aimed past **both** crossings it is already standing next to,
+  instead of finishing a leg on the tick it was planned. Nothing is allocated per tick.
+
+  The route search itself is **faster on open ground** (a 96×96 test field: 44 → 30 µs per search —
+  boundary costs make its estimate tighter) and **slower on cluttered ground** (the Field sample:
+  29 → 40 µs — costing the way around walls makes it look at about 25% more nodes). An 800-unit
+  order tick on the open field is unchanged: 47.2 → 45.8 ms.
+
+- **What it costs to build.** Building the graph now also builds the table of boundary-to-boundary
+  costs, and on a cluttered mesh that is most of the work: the 22k-triangle Field at cell 16 went
+  from 13 ms to **~45 ms** (cell 32: 10 → 41 ms, measured with tiered compilation off). It was
+  ~80 ms when the table first landed, and three things brought it down without changing a single
+  value. The way-around search — 80% of the Field's boundary pairs have a wall on the straight line
+  between them — reads a small per-triangle table instead of taking a square root at every step, and
+  stops as soon as it has the boundary it was asked about. The straight-line check decides with exact
+  integer comparisons and divides only where it has a real candidate. And the automatic install
+  measures a cell size before committing to it, so it never builds the table for one it is about to
+  reject. Between them, the Field's boot — which tries two cell sizes and keeps the second — went
+  from ~207 ms to **~50 ms**.
+
+  A static mesh pays this once, at boot. A game that re-bakes at runtime pays it per re-bake, off the
+  tick — and from the second re-bake of a match on, the graph being prepared **copies the rows of
+  every node the re-bake left alone** from the graph it is replacing. (A node's costs depend on its
+  own cell and the eight around it, and one building changes one cell.) On the Field's re-baked
+  meshes that is **10.8 ms per re-bake instead of 43.6 at cell 32** (cell 16: 7.7 instead of 52.2;
+  eight buildings at once: 15.2) — bit for bit the same graph a plain build gives, with nothing
+  allocated once it is running. The first re-bake after boot still builds whole, because the graph it
+  would have copied from was made from the asset's own triangulation, plus about 3 ms spent finding
+  that out. The table itself is small: 288 KB for the Field at cell 16. On open ground the way-around
+  search never runs at all, and what a build costs there is the straight-line checks along its border
+  nodes (the 96×96 field: 50 ms at cell 16).
+
+- **Compatibility.** These costs fold into the navigation fingerprint, so **a 0.13.x replay of a game
+  that planned in legs is refused** by this version, exactly as a changed mesh would be, and a 0.13.x
+  client and a 0.14 client refuse each other before the match starts. (0.13.1 changed nothing on this
+  side, so both 0.13 releases sit together here.) Games with no graph at all —
+  every mesh inside the A\* budget, or `autoInstallAbstractGraph: false` — are unchanged bit for bit.
+  **No public API was removed or renamed.**
+
+### Fixed — a graph you install yourself could be quietly replaced by the one before it
+
+- **What went wrong.** The engine can prepare the graph for a coming mesh swap ahead of time, off the
+  tick. If your game installed its own graph with `SetAbstractGraph` *after* that had already
+  happened, the prepared one was left in place — and the next swap adopted it, silently putting the
+  **previous cell size** back. From then on, a machine that had prepared and a machine that had not
+  were planning on two different graphs. A swap happens mid-match, which is after the fingerprint
+  check players pass when they join, so nothing caught it: the two simply drifted apart. Installing a
+  graph now discards anything prepared for the one it replaces.
+
+- **Brawler sample.** The replay file path is resolved in `Awake` rather than in a field initialiser,
+  so it no longer asks Unity for a user-data path before Unity is ready to answer.
+
+### Added — diagnostics: what the automatic install did, and what a mesh is not telling you
+
+- **`FPNavAgentSystem.DebugLadderProbes` and `DebugLadderPairTablesBuilt`.** The automatic install
+  tries cell sizes from the top down until one fits. The first counts how many it tried, the second
+  how many it actually built out — at most one per install. The gap between them is the work the boot
+  no longer does.
+
+- **Ground that costs less than plain distance is now reported.** Route estimates assume no triangle
+  is *cheaper* to cross than the distance across it. Nothing stops a mesh from carrying one — a road
+  at half cost is natural to author — and where one exists the estimate stops being conservative, so
+  a first hop may not be the best one. The build now says so once, with a count, instead of staying
+  quiet about it.
+
+- **A mesh whose triangles disagree about who their neighbours are is reported, not fatal.** Meshes
+  Klotho builds cannot be like this; a hand-made or third-party one can, and nothing checks it on
+  load. Such a pair is now skipped with an error naming how many were found, rather than stopping the
+  mesh swap it turned up in.
+
+- **A swap says why it could not reuse the graph it had.** When the prepared graph cannot hand over
+  its rows — a different cell size, or a mesh that has already been recycled — the swap log now names
+  the reason, instead of only reporting the cases that worked.
+
 ## [0.13.1] - 2026-09-09
 
 ### Fixed — transport teardown: the manager field is no longer handled outside the lock that guards it

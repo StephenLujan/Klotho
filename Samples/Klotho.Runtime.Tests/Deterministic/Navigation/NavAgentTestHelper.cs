@@ -250,6 +250,24 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         /// is wider than any footprint this helper can place, so on it the projection's one-ring
         /// reach never binds and the limit cannot be observed.
         /// </summary>
+        /// <summary>
+        /// A corridor ONE lattice cell wide and <paramref name="quads"/> long. Both long sides are
+        /// walls, so every node comes out wall-near and its pairs are walked rather than taken
+        /// straight; a segment down the middle crosses two triangles per quad. That combination is
+        /// what makes this the shape that can exhaust a segment walk — a wide field cannot, because
+        /// the walk ends as soon as the mesh does.
+        /// </summary>
+        public static FPNavMesh CreateStripNavMesh(int quads)
+        {
+            var builder = new QuadMeshBuilder();
+            for (int gx = 0; gx < quads; gx++)
+                builder.AddCell(gx, 0);
+            return builder.Build();
+        }
+
+        /// <summary>World size of one lattice cell in the meshes built here.</summary>
+        public const double LatticeCell = CELL;
+
         public static FPNavMesh CreateOpenFieldNavMesh(int cells, double gridCellSize)
         {
             var builder = new QuadMeshBuilder();

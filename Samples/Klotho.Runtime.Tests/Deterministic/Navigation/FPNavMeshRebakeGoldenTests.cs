@@ -127,7 +127,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         /// Field placements — frozen from a scan (start (-90,-80), step 1.7, footprint 0.6,
         /// first 32 that validate against everything accepted so far). See rule 2 above.
         /// </summary>
-        private static readonly (double x, double z)[] FieldCenters =
+        internal static readonly (double x, double z)[] FieldCenters =
         {
             (-90.0, -46.0), (-90.0, -5.2), (-90.0, 54.3), (-88.3, -46.0),
             (-88.3, -5.2), (-88.3, 54.3), (-86.6, -46.0), (-86.6, -5.2),
@@ -140,9 +140,9 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         };
 
         private const double SlabHalf = 0.5;
-        private const double FieldHalf = 0.3;
+        internal const double FieldHalf = 0.3;
 
-        private static FPBuildingRect[] Take((double x, double z)[] centers, int count, double half)
+        internal static FPBuildingRect[] Take((double x, double z)[] centers, int count, double half)
         {
             var rects = new FPBuildingRect[count];
             for (int i = 0; i < count; i++)

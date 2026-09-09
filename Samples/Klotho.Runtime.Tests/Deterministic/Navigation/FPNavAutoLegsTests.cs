@@ -186,7 +186,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             Assert.AreEqual(cell, auto.AbstractGraph.CellSize, "same cell size from the same ladder");
             Assert.AreEqual(explicitly.GetNavFingerprint(), auto.GetNavFingerprint(),
                 "same fingerprint — the constructor did exactly what the one-line call did");
-            Assert.AreEqual(unchecked((long)0xB5E5C29564219934UL), auto.GetNavFingerprint(),
+            Assert.AreEqual(unchecked((long)0x5B82AF48D6337593UL), auto.GetNavFingerprint(),   // 0xB5E5C29564219934 before rule revision 6 (pair-table costs)
                 "and it is the value measured with the explicit helper before the constructor learned to call it");
         }
 

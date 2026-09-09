@@ -252,9 +252,43 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                         $"  cell {cell,5:F1}   {g.NodeCount,6} nodes, {g.EdgeCount,6} edges   " +
                         $"largest node {largest,5} tris, diameter {g.MaxNodeDiameter,4}" +
                         (g.MaxNodeDiameter >= cap ? "   <-- OVER the cap" : "") +
-                        $"   {sw.Elapsed.TotalMilliseconds,7:F2} ms");
+                        $"   {sw.Elapsed.TotalMilliseconds,7:F2} ms" +
+                        $"   pair table {g.PairEntryCount * 8 / 1024,5} KB, reverse unmatched {g.DebugReverseUnmatched}");
                 }
                 TestContext.Out.WriteLine("");
+            }
+
+            // Two rows the real assets cannot give. A synthetic open field, whose convex nodes never
+            // run the walled-pair search, is the floor a derivation can have at this size; and the
+            // Field through the install ladder is what a boot actually pays — every candidate the
+            // ladder tries is a derivation, and until the ladder stopped building the pair table
+            // for candidates it was going to reject, that was two full ones on the Field.
+            {
+                var synth = NavAgentTestHelper.CreateOpenFieldNavMesh(96);
+                TestContext.Out.WriteLine($"--- synthetic open field 96x96 ({synth.Triangles.Length} tris) ---");
+                foreach (double cell in new[] { 16.0, 32.0 })
+                {
+                    var sw = Stopwatch.StartNew();
+                    var g = new FPNavAbstractGraph(synth, FP64.FromDouble(cell), FPNavAbstractCostFold.Min,
+                        FPNavAgentSystem.DEFAULT_AREA_MASK);
+                    sw.Stop();
+                    TestContext.Out.WriteLine(
+                        $"  cell {cell,5:F1}   {g.NodeCount,6} nodes, {g.EdgeCount,6} edges   {sw.Elapsed.TotalMilliseconds,7:F2} ms" +
+                        $"   pair table {g.PairEntryCount * 8 / 1024,5} KB, mid-distance fills {g.DebugMidDistFills}, walk steps {g.DebugWalkSteps}");
+                }
+                TestContext.Out.WriteLine("");
+
+                string fieldPath = Path.Combine(root, Assets[0]);
+                if (File.Exists(fieldPath))
+                {
+                    FPNavMesh field = FPNavMeshSerializer.Deserialize(fieldPath);
+                    var sw = Stopwatch.StartNew();
+                    var system = NavAgentTestHelper.CreateSystem(field, null);   // default tuning: the ladder runs in the constructor
+                    sw.Stop();
+                    TestContext.Out.WriteLine(
+                        $"--- Field through the install ladder: {sw.Elapsed.TotalMilliseconds:F2} ms wall clock, " +
+                        $"installed cell {system.AbstractGraph?.CellSize.ToDouble():F1} ---");
+                }
             }
         }
 
@@ -371,5 +405,202 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 TestContext.Out.WriteLine("");
             }
         }
+
+        #region P0 — the real asset, walked and analysed (Plan-MidHopEntryPoint)
+
+        private static FPVector3 Centroid3(FPNavMesh mesh, int tri)
+        {
+            var t = mesh.Triangles[tri];
+            return (mesh.Vertices[t.v0] + mesh.Vertices[t.v1] + mesh.Vertices[t.v2]) * (FP64.One / FP64.FromInt(3));
+        }
+
+        private struct FieldWalk
+        {
+            public string Status; public int Ticks; public double Distance; public int Legs;
+            public double MidDistance, MidStraight;
+            public int Exhausted, LegResolveFailed, CorridorTruncated, Partial;
+            public string Graph;
+        }
+
+        /// <summary>
+        /// One agent on the shipped asset. <paramref name="tuning"/> decides flat or auto-legs;
+        /// <paramref name="cell"/> &gt; 0 installs an explicit graph over whatever the tuning did.
+        /// Cut at every leg hand-off so the middle of the route can be read on its own (V-M0's
+        /// measure, on the real mesh — V-M1).
+        /// </summary>
+        private static FieldWalk WalkField(FPNavMesh mesh, FPVector3 start, FPVector3 goal,
+            FPNavTuning tuning, double cell)
+        {
+            var system = NavAgentTestHelper.CreateSystem(mesh, null, tuning, out var pathfinder);
+            if (cell > 0)
+                system.SetAbstractGraph(new FPNavAbstractGraph(
+                    mesh, FP64.FromDouble(cell), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK));
+            var g = system.AbstractGraph;
+            var w = new FieldWalk { Graph = g == null ? "flat" : $"cell {g.CellSize.ToDouble():F0} ({g.NodeCount} nodes)" };
+
+            var query = new FPNavMeshQuery(mesh, null);
+            int tri = query.FindTriangle(start.ToXZ(), start.y);
+            Assert.GreaterOrEqual(tri, 0, "start is on the mesh");
+            var frame = NavAgentTestHelper.CreateFrameWithAgent(start, tri, out var entity, out var entities);
+            ref var nav0 = ref frame.Get<NavAgentComponent>(entity);
+            NavAgentComponent.SetDestination(ref nav0, goal);
+
+            FPVector3 prev = start; double travelled = 0; int legsSeen = 0;
+            FPVector3 firstHandoff = start, lastHandoff = start; double atFirst = 0, atLast = 0;
+            const int budget = 30000;
+            for (int tick = 1; tick <= budget; tick++)
+            {
+                system.Update(ref frame, entities, 1, tick, NavAgentTestHelper.DT);
+                ref readonly var nav = ref frame.GetReadOnly<NavAgentComponent>(entity);
+                travelled += FPVector2.Distance(prev.ToXZ(), nav.Position.ToXZ()).ToDouble();
+                prev = nav.Position;
+                if (system.DebugLegAdvanceCount > legsSeen)
+                {
+                    legsSeen = system.DebugLegAdvanceCount;
+                    if (legsSeen == 1) { firstHandoff = nav.Position; atFirst = travelled; }
+                    lastHandoff = nav.Position; atLast = travelled;
+                }
+                bool done = nav.Status == (byte)FPNavAgentStatus.Arrived || nav.Status == (byte)FPNavAgentStatus.PathFailed;
+                if (done || tick == budget)
+                {
+                    w.Status = nav.Status == (byte)FPNavAgentStatus.Arrived ? "Arrived"
+                        : nav.Status == (byte)FPNavAgentStatus.PathFailed ? "PathFailed" : "timeout";
+                    w.Ticks = tick; w.Distance = travelled; w.Legs = system.DebugLegAdvanceCount;
+                    if (w.Legs >= 2)
+                    {
+                        w.MidDistance = atLast - atFirst;
+                        w.MidStraight = FPVector2.Distance(firstHandoff.ToXZ(), lastHandoff.ToXZ()).ToDouble();
+                    }
+                    break;
+                }
+            }
+            w.Exhausted = pathfinder.DebugIterationExhaustedCount;
+            w.LegResolveFailed = system.DebugLegResolveFailedCount;
+            w.CorridorTruncated = pathfinder.DebugCorridorTruncatedCount + system.DebugCorridorCopyTruncatedCount;
+            w.Partial = pathfinder.DebugPartialPathCount;
+            return w;
+        }
+
+        /// <summary>
+        /// V-M1 — the real asset. Two routes on Field: the one the visualizer reported as failing
+        /// flat (the parent plan's §1e), and the long diagonal. Flat is attempted with a large budget
+        /// and NO graph, and its number only counts when nothing was clamped or partial — beyond the
+        /// corridor buffer a flat walk is a chain of clamped partials, not an optimum. The honest
+        /// reading is legs / straight, before and after.
+        /// </summary>
+        [Test]
+        public void P0_FieldWalk_LegsAgainstStraight()
+        {
+            string path = Path.Combine(RepoRoot(), Assets[0]);
+            if (!File.Exists(path)) { TestContext.Out.WriteLine($"{Assets[0]}: MISSING"); return; }
+            FPNavMesh mesh = FPNavMeshSerializer.Deserialize(path);
+
+            // Route 1: the visualizer's failing pair (38.7 units). Route 2: the long diagonal, from
+            // the walkable triangle with the smallest x+z centroid to the one with the largest.
+            var r1s = new FPVector3(FP64.FromDouble(-24.14), FP64.Zero, FP64.FromDouble(1.86));
+            var r1g = new FPVector3(FP64.FromDouble(14.46), FP64.Zero, FP64.FromDouble(-0.48));
+            var probe = new FPNavAbstractGraph(mesh, FP64.FromInt(32), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK);
+            int lo = -1, hi = -1; FP64 loV = FP64.MaxValue, hiV = FP64.MinValue;
+            for (int t = 0; t < mesh.Triangles.Length; t++)
+            {
+                if (probe.NodeOf(t) < 0) continue;
+                var c = Centroid3(mesh, t).ToXZ(); FP64 v = c.x + c.y;
+                if (v < loV) { loV = v; lo = t; }
+                if (v > hiV) { hiV = v; hi = t; }
+            }
+            var r2s = Centroid3(mesh, lo); var r2g = Centroid3(mesh, hi);
+
+            var flatBig = new FPNavTuning(maxIterations: 1 << 20, autoInstallAbstractGraph: false);
+            TestContext.Out.WriteLine("=== V-M1 — Field: legs / straight, middle ratio, and whether flat can even be measured ===");
+            foreach (var (label, s, gl) in new[] { ("route 1 (visualizer pair)", r1s, r1g), ("route 2 (diagonal)", r2s, r2g) })
+            {
+                double straight = FPVector2.Distance(s.ToXZ(), gl.ToXZ()).ToDouble();
+                TestContext.Out.WriteLine($"--- {label}: ({s.x.ToDouble():F2}, {s.z.ToDouble():F2}) -> ({gl.x.ToDouble():F2}, {gl.z.ToDouble():F2})  straight {straight:F1} ---");
+                foreach (var (name, tuning, cell) in new[]
+                {
+                    ("flat, big budget", flatBig, 0.0),
+                    ("auto (default)  ", FPNavTuning.Default, 0.0),
+                    ("cell 16         ", NavAgentTestHelper.NoAutoGraph, 16.0),
+                    ("cell 32         ", NavAgentTestHelper.NoAutoGraph, 32.0),
+                })
+                {
+                    var w = WalkField(mesh, s, gl, tuning, cell);
+                    string mid = w.Legs >= 2 && w.MidStraight > 0 ? $"middle {w.MidDistance / w.MidStraight,6:F3}x over {w.MidStraight,5:F1}" : "middle    n/a";
+                    string valid = w.CorridorTruncated == 0 && w.Partial == 0 && w.Exhausted == 0 ? "" : "  <-- clamped/partial/exhausted: not a baseline";
+                    TestContext.Out.WriteLine(
+                        $"  {name} [{w.Graph,-22}] {w.Status,-10} {w.Ticks,6} ticks  total {w.Distance / straight,6:F3}x  {mid}  " +
+                        $"legs {w.Legs,3}  exhausted {w.Exhausted} truncated {w.CorridorTruncated} partial {w.Partial} legFail {w.LegResolveFailed}{valid}");
+                }
+                TestContext.Out.WriteLine("");
+            }
+        }
+
+        /// <summary>
+        /// V-M11 — how often a straight line between two portals of one node is not walkable. For
+        /// every node and every pair of its portals, the real A* + funnel path between the portal
+        /// midpoints is compared with the Euclidean distance. A ratio above ~1 means a wall between
+        /// them: exactly the pairs a midpoint-to-midpoint cost model under-prices, and the only pairs
+        /// an intra-node distance table (D-P4) would need. The unconstrained path is a lower bound
+        /// on the in-node distance, so a path that leaves the node is counted separately.
+        /// </summary>
+        [Test]
+        public void P0_PortalPairAnalysis_WallsBetweenPortals()
+        {
+            string path = Path.Combine(RepoRoot(), Assets[0]);
+            if (!File.Exists(path)) { TestContext.Out.WriteLine($"{Assets[0]}: MISSING"); return; }
+            FPNavMesh mesh = FPNavMeshSerializer.Deserialize(path);
+            var tuning = new FPNavTuning(maxIterations: 1 << 16, autoInstallAbstractGraph: false);
+            var query = new FPNavMeshQuery(mesh, null, tuning);
+            var pathfinder = new FPNavMeshPathfinder(mesh, query, null, tuning);
+            var funnel = new FPNavMeshFunnel(mesh, query, null, tuning);
+
+            TestContext.Out.WriteLine("=== V-M11 — Field: portal pairs per node, A*+funnel length / Euclid between midpoints ===");
+            foreach (double cell in new[] { 16.0, 32.0 })
+            {
+                var g = new FPNavAbstractGraph(mesh, FP64.FromDouble(cell), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK);
+                long pairs = 0, over105 = 0, over120 = 0, leftNode = 0, failed = 0;
+                int nodesWithWall = 0; double maxRatio = 0; int maxNode = -1;
+                var worst = new List<(double ratio, int node)>();
+                for (int n = 0; n < g.NodeCount; n++)
+                {
+                    g.EdgeRange(n, out int es, out int ee);
+                    bool wall = false;
+                    for (int i = es; i < ee; i++)
+                    for (int j = i + 1; j < ee; j++)
+                    {
+                        FPVector3 a = g.EdgePortal(i), b = g.EdgePortal(j);
+                        double euclid = FPVector2.Distance(a.ToXZ(), b.ToXZ()).ToDouble();
+                        if (euclid <= 0.0) continue;
+                        pairs++;
+                        if (!pathfinder.FindPath(a, b, FPNavAgentSystem.DEFAULT_AREA_MASK, FP64.Zero,
+                                out int[] corridor, out int len, out bool partial, out _) || partial)
+                        { failed++; continue; }
+                        bool inside = true;
+                        for (int k = 0; k < len; k++) if (g.NodeOf(corridor[k]) != n) { inside = false; break; }
+                        int corners = funnel.FindCorners(corridor, len, a, b, FPNavMeshFunnel.MAX_WAYPOINTS);
+                        double length = 0; FPVector3 p = a;
+                        for (int k = 0; k < corners; k++) { length += FPVector2.Distance(p.ToXZ(), funnel.Corners[k].ToXZ()).ToDouble(); p = funnel.Corners[k]; }
+                        length += FPVector2.Distance(p.ToXZ(), b.ToXZ()).ToDouble();
+                        double ratio = length / euclid;
+                        if (!inside) leftNode++;
+                        if (ratio > 1.05) { over105++; wall = true; }
+                        if (ratio > 1.20) over120++;
+                        if (ratio > maxRatio) { maxRatio = ratio; maxNode = n; }
+                        if (ratio > 1.05) worst.Add((ratio, n));
+                    }
+                    if (wall) nodesWithWall++;
+                }
+                worst.Sort((x, y) => y.ratio.CompareTo(x.ratio));
+                TestContext.Out.WriteLine(
+                    $"  cell {cell,3:F0}: {g.NodeCount} nodes, {pairs} pairs | ratio > 1.05: {over105} ({100.0 * over105 / System.Math.Max(1, pairs):F2}%)  > 1.20: {over120}  " +
+                    $"max {maxRatio:F3} (node {maxNode}) | nodes with any wall pair {nodesWithWall} ({100.0 * nodesWithWall / g.NodeCount:F1}%) | " +
+                    $"paths that left the node {leftNode}  failed/partial {failed}");
+                for (int k = 0; k < System.Math.Min(5, worst.Count); k++)
+                    TestContext.Out.WriteLine($"      worst: node {worst[k].node} ratio {worst[k].ratio:F3}");
+            }
+        }
+
+        #endregion
+
     }
 }

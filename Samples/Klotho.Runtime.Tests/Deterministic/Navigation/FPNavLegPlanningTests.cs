@@ -1,3 +1,4 @@
+using System;
 using NUnit.Framework;
 
 using xpTURN.Klotho.ECS;
@@ -17,9 +18,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
     public class FPNavLegPlanningTests
     {
         private static (FPNavAgentSystem system, Frame frame, EntityRef entity, EntityRef[] entities)
-            Walker(FPNavMesh mesh, FPVector3 start, FPVector3 destination, double cellSize)
+            Walker(FPNavMesh mesh, FPVector3 start, FPVector3 destination, double cellSize,
+                FPNavTuning? tuning = null)
         {
-            var system = NavAgentTestHelper.CreateSystem(mesh, null);
+            var system = tuning.HasValue
+                ? NavAgentTestHelper.CreateSystem(mesh, null, tuning.Value, out _)
+                : NavAgentTestHelper.CreateSystem(mesh, null);
             if (cellSize > 0)
                 system.SetAbstractGraph(new FPNavAbstractGraph(
                     mesh, FP64.FromDouble(cellSize), FPNavAbstractCostFold.Min,
@@ -887,6 +891,59 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             Assert.AreEqual(1, system.DebugGraphInstancesCreated, "five calls, one derivation");
         }
 
+        /// <summary>
+        /// The spare is built to the live graph's build identity and its cell size is readonly, so a
+        /// graph installed after it was prepared leaves a spare that can only re-install the OLD cell
+        /// size. Adopting it would split the fingerprint between a peer that prepared and one that
+        /// did not — after Ready has passed, since a swap only happens mid-match. The editor tools
+        /// reach this by placing a building, changing the cell size, and placing another.
+        /// </summary>
+        [Test]
+        public void AGraphInstalledAfterPreparing_DropsTheSpare_SoTheSwapCannotAdoptTheOldCellSize()
+        {
+            var (prepared, meshA, meshB) = SwapPair();      // both installed at cell 8
+            var (control, otherA, otherB) = SwapPair();
+
+            prepared.PrepareAbstractGraphFor(meshB);        // the spare is frozen at cell 8 here
+
+            prepared.SetAbstractGraph(new FPNavAbstractGraph(
+                meshA, FP64.FromInt(4), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK));
+            control.SetAbstractGraph(new FPNavAbstractGraph(
+                otherA, FP64.FromInt(4), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK));
+
+            prepared.SwapNavMesh(meshB);
+            control.SwapNavMesh(otherB);                    // never prepared: derives on the tick
+
+            Assert.AreEqual(4.0, prepared.AbstractGraph.CellSize.ToDouble(), 1e-9,
+                "the graph after the swap is the cell size the game installed, not the spare's");
+            Assert.AreEqual(0, prepared.DebugGraphPreparedAdoptedCount,
+                "the stale spare is not adopted — it was dropped when the graph was replaced");
+            Assert.AreEqual(control.GetNavFingerprint(), prepared.GetNavFingerprint(),
+                "and preparing still cannot be observed: both peers land on the same graph");
+        }
+
+        /// <summary>
+        /// Preparing again after the install is what the frame heartbeat actually does, and it has to
+        /// rebuild rather than reuse — the dropped spare costs one allocation, and the graph adopted
+        /// is the new cell size.
+        /// </summary>
+        [Test]
+        public void PreparingAgainAfterAnInstall_RebuildsTheSpareAtTheNewCellSize()
+        {
+            var (system, meshA, meshB) = SwapPair();
+            system.PrepareAbstractGraphFor(meshB);
+            Assert.AreEqual(1, system.DebugGraphInstancesCreated, "fixture: one spare so far");
+
+            system.SetAbstractGraph(new FPNavAbstractGraph(
+                meshA, FP64.FromInt(4), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK));
+            system.PrepareAbstractGraphFor(meshB);
+            system.SwapNavMesh(meshB);
+
+            Assert.AreEqual(2, system.DebugGraphInstancesCreated, "the stale one was dropped, not reused");
+            Assert.AreEqual(1, system.DebugGraphPreparedAdoptedCount);
+            Assert.AreEqual(4.0, system.AbstractGraph.CellSize.ToDouble(), 1e-9);
+        }
+
         /// <summary>With no graph installed there is nothing to prepare, and asking costs nothing.</summary>
         [Test]
         public void WithNoGraph_PreparingIsANoOp()
@@ -990,6 +1047,74 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         }
 
         #endregion
+
+
+        #region P0 sentinel — the ratio off the diagonal, guarded in the normal suite (V-M12)
+
+        /// <summary>
+        /// The upper bound on legs / straight for the 27° route below, pinned from the P1
+        /// measurement on this fixture (0.9968 over 7 legs, 2026-09-08; it was 1.0616 over 8 legs
+        /// before hops were priced portal to portal) with a hundredth of slack. Re-pin it when a
+        /// plan changes where a leg aims — the number is the point, not the assertion.
+        /// </summary>
+        private const double LegsOverStraightPin = 1.01;
+
+        /// <summary>
+        /// The perf harnesses that measure route quality are <c>[Explicit]</c>, so nothing in the
+        /// normal suite would notice a regression in what a hierarchical route costs — or, as the
+        /// 0.13 default install showed, that "flat" quietly stopped being flat. This keeps the
+        /// verdicts in the suite on a fixture small enough to run every time: flat really has no
+        /// graph, the legged walk stays inside its pin, and no leg fails to resolve. The mesh is
+        /// past the auto-install threshold on purpose, so the flat control has to ask for no graph.
+        /// </summary>
+        [Test]
+        public void P0Sentinel_TheRatioOffTheDiagonal_StaysInsideItsPin()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(48);   // 4,608 tris: past the auto threshold
+            FPVector3 start = NavAgentTestHelper.CellCenter(2, 2);
+            FPVector3 goal = NavAgentTestHelper.CellCenter(42, 22);      // 2 east per 1 north, ~27 degrees
+            double straight = FPVector2.Distance(start.ToXZ(), goal.ToXZ()).ToDouble();
+
+            // Flat control: no graph, and it must stay that way — the default tuning would install one.
+            var (flat, flatFrame, flatEntity, flatEntities) =
+                Walker(mesh, start, goal, cellSize: 0, tuning: NavAgentTestHelper.NoAutoGraph);
+            Assert.IsNull(flat.AbstractGraph, "flat means no graph installed");
+            Walk(flat, ref flatFrame, flatEntity, flatEntities, maxTicks: 8000);
+            Assert.AreEqual((byte)FPNavAgentStatus.Arrived, flatFrame.Get<NavAgentComponent>(flatEntity).Status,
+                "the flat control arrives");
+            Assert.IsNull(flat.AbstractGraph, "and still has no graph afterwards");
+
+            // Legged walk, distance tracked, allocation checked once the walk is warm.
+            var (legged, frame, entity, entities) =
+                Walker(mesh, start, goal, cellSize: 16, tuning: NavAgentTestHelper.NoAutoGraph);
+            Assert.IsNotNull(legged.AbstractGraph, "the legged walk has the explicit graph");
+            FPVector3 prev = start; double travelled = 0; long allocated = 0; int tick;
+            for (tick = 1; tick <= 8000; tick++)
+            {
+                long before = tick > 64 ? GC.GetAllocatedBytesForCurrentThread() : 0;
+                legged.Update(ref frame, entities, entities.Length, tick, NavAgentTestHelper.DT);
+                if (tick > 64) allocated += GC.GetAllocatedBytesForCurrentThread() - before;
+                ref readonly var nav = ref frame.GetReadOnly<NavAgentComponent>(entity);
+                travelled += FPVector2.Distance(prev.ToXZ(), nav.Position.ToXZ()).ToDouble();
+                prev = nav.Position;
+                if (nav.Status == (byte)FPNavAgentStatus.Arrived || nav.Status == (byte)FPNavAgentStatus.PathFailed)
+                    break;
+            }
+            double ratio = travelled / straight;
+            TestContext.Out.WriteLine(
+                $"27-degree route, straight {straight:F1}: legs/straight {ratio:F4} over {legged.DebugLegAdvanceCount} legs in {tick} ticks, " +
+                $"{allocated} B allocated after warm-up (pin {LegsOverStraightPin})");
+
+            Assert.AreEqual((byte)FPNavAgentStatus.Arrived, frame.Get<NavAgentComponent>(entity).Status, "the legged walk arrives");
+            Assert.Greater(legged.DebugLegAdvanceCount, 1, "and it was planned in legs");
+            Assert.AreEqual(0, legged.DebugLegResolveFailedCount, "no leg the real search could not solve");
+            Assert.LessOrEqual(ratio, LegsOverStraightPin,
+                $"legs/straight {ratio:F4} is past the pin {LegsOverStraightPin} — a plan changed where a leg aims; re-pin on purpose or fix it");
+            Assert.AreEqual(0, allocated, "a legged walk allocates nothing per tick once warm");
+        }
+
+        #endregion
+
 
     }
 }

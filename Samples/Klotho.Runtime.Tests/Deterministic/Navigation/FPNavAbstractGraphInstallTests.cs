@@ -204,6 +204,51 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
             Assert.AreEqual(byHand.GetNavFingerprint(), helped.GetNavFingerprint(),
                 "the helper must build exactly what the reported arguments build, or a peer that "
                 + "wires it by hand walks a different partition");
+
+            // Two derivations on the ladder, one pair table: the 64 candidate stops at its
+            // diameter (over the cap) and only the 32 it keeps is built out. Before that, the
+            // Field's boot paid two full pair tables and read one.
+            Assert.AreEqual(2, helped.DebugLadderProbes, "64 then 32");
+            Assert.AreEqual(1, helped.DebugLadderPairTablesBuilt, "the pair table is built for the cell the ladder keeps, only");
+        }
+
+        [Test]
+        public void VA2b_TheLadderBuildsThePairTableOnlyForTheCellItKeeps()
+        {
+            // A cap small enough that the ladder has to step down more than once on a small mesh:
+            // every step but the last stops at its diameter. The mesh is within the iteration
+            // budget, so the constructor does not run the ladder itself (that gate asks about the
+            // budget, not the cap) — the helper is called, as VA5 does. The counters are
+            // cumulative; a fresh system reads them directly.
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(16);
+            var tuning = new FPNavTuning(corridorCap: 16);
+            var system = CreateSystem(mesh, tuning, out _);
+            Assert.AreEqual(FPNavAbstractGraphInstall.Installed, system.TryInstallAbstractGraphIfBeneficial(out _),
+                "fixture: a cell size fits a cap of 16 on this mesh");
+
+            Assert.IsNotNull(system.AbstractGraph);
+            Assert.GreaterOrEqual(system.DebugLadderProbes, 3, "fixture: the ladder stepped down more than once");
+            Assert.AreEqual(1, system.DebugLadderPairTablesBuilt, "one pair table, for the cell that was kept");
+            Assert.Greater(system.AbstractGraph.EdgeCount, 0, "and that graph is the whole derivation");
+            Assert.AreNotEqual(0UL, system.AbstractGraph.Checksum);
+        }
+
+        /// <summary>
+        /// What replaced the refusal: the state it refused cannot be built. The ladder measures
+        /// with a probe that hands back a number, so every graph a caller can hold has its edges,
+        /// its pair table and a checksum — there is no second value domain to guard against.
+        /// </summary>
+        [Test]
+        public void VA2c_EveryConstructedGraph_IsWholeAndInstallable()
+        {
+            var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(12);
+            var graph = new FPNavAbstractGraph(
+                mesh, FP64.FromDouble(8.0), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK);
+            Assert.Greater(graph.EdgeCount, 0);
+            Assert.AreNotEqual(0UL, graph.Checksum);
+
+            var system = CreateSystem(mesh, NoAuto, out _);
+            Assert.DoesNotThrow(() => system.SetAbstractGraph(graph));
         }
 
         /// <summary>
@@ -294,6 +339,8 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
 
             Assert.AreEqual(FPNavAbstractGraphInstall.NoCellSizeFits, outcome);
             Assert.AreEqual(0.0, cellSize.ToDouble(), 1e-9);
+            Assert.Greater(system.DebugLadderProbes, 0, "the ladder ran");
+            Assert.AreEqual(0, system.DebugLadderPairTablesBuilt, "no candidate fit, so no pair table was built");
         }
 
         #endregion
@@ -323,7 +370,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 + "that turning the automatic install off costs nothing to a game that does");
 
             var auto = CreateSystem(mesh, FPNavTuning.Default, out _);
-            Assert.AreEqual(unchecked((long)0xB5E5C29564219934UL), auto.GetNavFingerprint(),
+            Assert.AreEqual(unchecked((long)0x5B82AF48D6337593UL), auto.GetNavFingerprint(),   // 0xB5E5C29564219934 before rule revision 6 (pair-table costs)
                 "the default stack on Field carries the automatic graph (cell 32, 81 nodes) — this "
                 + "is what a 0.13 game that never named a tuning is refused against");
         }

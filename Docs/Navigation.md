@@ -554,14 +554,17 @@ involved in any of it.
 Measured with `FPNavAgentCrowdPerfTests` (`[Explicit]`, Release, warmup 32) on a 96×96-cell open
 field — 192×192 world units, 18,432 triangles — with agents on a 1.5-unit lattice. Median ms per
 tick, .NET 8 on one desktop machine: read the **shape**, not the absolute numbers, and re-measure on
-your target before budgeting against them.
+your target before budgeting against them. **These are flat numbers**: the harness asks for no
+abstract graph (`NavAgentTestHelper.NoAutoGraph`), because since 0.13 the agent system would
+install one on this mesh by itself and the storm below would not exist — that is the point of the
+[section on legs](#planning-in-legs). Re-measured under the 0.13 defaults (partial paths on).
 
 | Agents | A* storm tick | ORCA + correction | path follow + movement | `Frame.CopyFrom` |
 |---:|---:|---:|---:|---:|
-| 64 | 41.8 | 0.47 | 0.34 | 0.002 |
-| 256 | 254.5 | 2.31 | 1.35 | 0.009 |
-| 800 | **968.8** | 12.21 | 4.23 | 0.028 |
-| 3200 | **4230.2** | 136.39 | 15.13 | 0.108 |
+| 64 | 42.5 | 0.49 | 0.33 | 0.009 |
+| 256 | 257.0 | 2.40 | 1.34 | 0.009 |
+| 800 | **983.5** | 12.65 | 4.22 | 0.027 |
+| 3200 | **4408.0** | 163.89 | 17.71 | 0.111 |
 
 Two things in that table are worth more than the rest:
 
@@ -570,19 +573,24 @@ agents costs ~16 ms; the tick where all 800 receive the order costs ~970 ms. The
 (`PathRepathCooldown`, default 10 ticks) does not help — it only gates agents that have *already*
 repathed, so an idle army all fires on the same tick.
 
-**Most of that second is spent failing.** The diagnostic counters say so directly: across the
-measured runs at 800 agents, 11,200 searches produced 6,542 corridor clamps and 4,658 budget
-exhaustions — every single search hit one cap or the other, and the ~42% that exhausted
-`MAX_ITERATIONS` returned **no path at all**, leaving those units in `PathFailed` with nothing
-logged. A cross-map order on a field this size is past the built-in ceiling, and before these
-counters existed that fact was invisible from outside the engine.
+**Most of that second is spent running out.** The diagnostic counters say so directly: across the
+measured runs at 800 agents, 11,200 searches produced 11,200 corridor clamps and 4,658 budget
+exhaustions — every single search hit the corridor cap, and the ~42% that exhausted
+`MAX_ITERATIONS` got a **partial path** (before 0.13 they got no path at all and sat in
+`PathFailed` with nothing logged; the exhaustion counts are identical, the outcome is not). A
+cross-map order on a field this size is past the built-in ceiling, and before these counters
+existed that fact was invisible from outside the engine.
 
-| Agents | searches | corridor-clamped | budget-exhausted (no path) |
+| Agents | searches | corridor-clamped | budget-exhausted (partial path) |
 |---:|---:|---:|---:|
 | 64 | 896 | 896 | 0 |
-| 256 | 3,584 | 3,233 | 351 |
-| 800 | 11,200 | 6,542 | 4,658 |
-| 3200 | 44,800 | 15,086 | 26,992 |
+| 256 | 3,584 | 3,584 | 351 |
+| 800 | 11,200 | 11,200 | 4,658 |
+| 3200 | 44,800 | 42,078 | 26,992 |
+
+The two counters overlap since 0.13: an exhausted search returns the corridor it has, and that
+corridor is clamped to the buffer like any other, so a search can count in both columns. Before
+partial paths the columns were disjoint (an exhausted search returned nothing to clamp).
 
 So the first thing to build for hundreds of units is not a faster A* — it is **not calling A* for
 everyone at once**: a bounded admission queue (promote K destinations per tick), and for
@@ -595,11 +603,12 @@ Both levers in this section — the admission queue and the cluster split below 
 Neither makes a search cheaper, so neither touches the failures. Be clear about that before
 budgeting around them:
 
-- **The ~42% that exhaust the budget still get no path.** They fail for the same reason whenever they
-  run. Admitting them over ten ticks produces ten ticks of failures instead of one.
+- **The ~42% that exhaust the budget still exhaust it.** They run out for the same reason whenever
+  they run, and walk a partial path to re-plan from. Admitting them over ten ticks produces ten
+  ticks of exhaustions instead of one.
 - **The admission queue does not fit a 10 Hz tick either.** Spread over ten ticks, the A* share is
-  ~97 ms — but by the last of those ticks every already-admitted unit is moving, so the steady-state
-  ~16 ms runs alongside it: **~113 ms against a 100 ms budget**, before any game logic or physics.
+  ~98 ms — but by the last of those ticks every already-admitted unit is moving, so the steady-state
+  ~17 ms runs alongside it: **~115 ms against a 100 ms budget**, before any game logic or physics.
 - **The cluster split does not help here at all.** It reduces the steady-state tick by ~10 ms, which
   is **1% of the order tick**. It is worth doing for the reasons in the next section; relieving a
   mass order is not one of them.
@@ -753,24 +762,28 @@ the walkable surface into nodes, hop nodes to pick a direction, and hand the rea
 current leg. A leg never leaves its node, so it never runs out of budget and never overruns the
 corridor buffer — the two caps stop binding instead of being raised.
 
-Measured on the same 96×96-cell field as the table above, 800 agents receiving one order:
+Measured on the same 96×96-cell field as the table above, 800 agents receiving one order — one
+run, one day, cell 16 (the flat row is the same harness with no graph; the counters are run
+totals):
 
 | | order tick | got no path | budget exhausted | corridor clamped |
 |---|---:|---:|---:|---:|
-| flat | 1001.7 ms | **358/800 (45%)** | 3,226 | 4,774 |
-| **in legs** | **38.0 ms** | **0** | **0** | **0** |
+| flat | 982.7 ms | 0 (partial paths since 0.13; 358/800 before) | 3,226 | 8,000 |
+| **in legs** | **45.8 ms** | **0** | **0** | **0** |
 
-**A hierarchical route is not the shortest one**, but the gap is small: a single unit crossing the
-field walks **1.10× the straight-line distance at worst** (1.11× at cell 32), and **1.01× on a long
-crossing** — the detour that remains is close to constant, so it dilutes as the route grows. Travel
-time tracks distance rather than exceeding it, and a unit changing legs dozens of times neither
-stalls nor circles at the boundaries.
+**A hierarchical route walks the straight line to within measurement.** A single unit crossing the
+field at 27° walks 0.995–1.000× the straight-line distance at cell 16 and 0.996–1.000× at cell 32,
+against 0.995–1.004× for the flat search on the same routes (the arrival threshold at the
+destination is why both sit a hair under 1). Travel time tracks distance rather than exceeding it, and a unit
+changing legs a dozen times neither stalls nor circles at the boundaries. Until 0.14 this
+paragraph said 1.10× at worst; what changed is below.
 
 **Measure the ratio off the diagonal.** The first measurements of this were all taken at exactly
 45°, which on a square lattice is the one heading where the route steps cleanly through node
 centres — the detour there is close to constant, so it dilutes over distance and the ratio looks
-better the further you go. Off the diagonal it does not dilute: the per-crossing component stays,
-and the honest worst case is the one quoted above. Two things keep it there:
+better the further you go. Off the diagonal a per-crossing component does not dilute, and that is
+where the detour lived: priced centre to centre, 27° routes walked 1.06–1.10× however long they
+were. Three things take it to 1.00:
 
 - The abstract search prices its first and last hop from **where the agent actually stands and
   where it is actually going**, not from the centres of the nodes those points sit in. An agent
@@ -779,30 +792,50 @@ and the honest worst case is the one quoted above. Two things keep it there:
 - A leg aims **along the portal** rather than at its midpoint, at the point that makes the crossing
   straightest given the portal after it. How much this is worth depends on how coarse the mesh is:
   a portal is one triangle edge, so a fine triangulation leaves little room to slide along it.
+- The hops **between** the two ends are priced the same way (0.14): from the portal a node is
+  entered by to the portal it is left by, not centre to centre. That distance is looked up from a
+  table derived with the graph — one row per portal of a node, straight-line for a pair the walk
+  between is clear, and the length of the walk around whatever is in the way for a pair it is not
+  (the same edge-midpoint cost the real A\* charges a corridor). One value is kept per *pair* of
+  portals and read for hops going either way through it: walking a pair the other way round is not
+  provably the same walk, and on that stage the two differ for about two portal pairs in five — which
+  changes the first hop of about one route in a thousand, because the abstract search is deciding
+  between much larger differences. A node's entry is chosen by the
+  best estimate *through* it rather than by the cheapest way *to* it, so a route no longer hugs
+  the nearest boundary point and then turns. On the 27° route the middle of the route walks
+  **1.000×** its straight line at cell 16 and 1.002× at cell 32, where it walked 1.06–1.10×
+  before; the 27° route across the 48-cell sentinel field fell from 1.062× to 0.997×. The table
+  costs derivation time — on a cluttered mesh it is most of a graph's derive cost (the Field at
+  cell 16: 45 ms, of which the walled-pair search is about half) — and nothing per tick.
 
 Two more things keep a unit from *behaving* badly at a node, both of which cost route length nothing
 and were only ever visible by watching:
 
-- **A leg ends when the crossing is made, not when the portal point is touched.** A portal is a
-  shared triangle edge, so reaching it leaves the agent on the near side with its node unchanged —
-  the planner would hand back the crossing just completed, and the hand-off keeps velocity, so the
-  unit circled instead of stalling. A plan that asks for the crossing just made is sent on to the
-  next one.
+- **A leg aims three crossings ahead, not at the next one.** A portal is a shared triangle edge, so
+  reaching it leaves the agent on the near side with its node unchanged — the planner would hand
+  back the crossing just completed, and the hand-off keeps velocity, so the unit circled instead of
+  stalling. The plan therefore skips crossings it is already within reach of. Measured, it skips
+  two on essentially every plan and aims at the third: the reach test compares against the previous
+  plan's target as well as the agent, and after a hand-off the crossing being asked for is inside
+  that ball by construction. So the practical rule is a **fixed three-hop lookahead**, and the
+  cost of being wrong about a skip is only that the leg looks one hop further. The alternative —
+  aiming at the next crossing — is what produced the circling, and removing the second reference
+  point doubles the number of legs on the same journey for the same travel time.
 - **A leg hands off at the agent's turning radius**, `v² / a`, rather than at the arrival threshold
   used for the destination. An agent cannot hold an arc tighter than that, so asking it to pass
   within a few centimetres of a portal it must turn at is asking for something no steering can do;
   it orbits the point. Handing off earlier is not a loss of precision — the leg planner exists to
   keep the *search* local, not to march the unit through gates.
 
-What remains is that the hops **between** the two ends are still priced centre to centre. On a long
-route that is where the leftover detour comes from.
-
 Cluster size is the dial, and it is bounded on both sides. Too small and a leg is two triangles long,
 so the unit commits to a portal every few metres for no gain; too large and a leg no longer fits the
 corridor buffer. On a 22k-triangle stage the usable window ran up to 32 world units per cell, with
-**16 the best measured** (larger cells detoured more without planning faster).
+**16 the best measured**: it plans fastest (800-agent order tick 45.8 ms against 60.9 at cell 32
+and 52.4 at cell 8), and since hops are priced portal to portal the larger cell no longer buys a
+longer walk either (the two are within a hundredth of each other on that stage).
 
-Three things are worth knowing before reaching for it:
+Three things are worth knowing, because since 0.13 this is something you turn *off* or narrow rather
+than something you reach for:
 
 - **It is on by default since 0.13, and the off switch is exact.** The agent system's constructor
   installs a graph itself when the mesh is one a flat search can run out of budget on
@@ -829,21 +862,33 @@ Three things are worth knowing before reaching for it:
   crossed, a detour only that agent pays and nothing reports.
 
 ```csharp
-// The whole wiring. Decides whether this mesh needs legs, picks the cell size, installs.
+// The same decision, made by hand — and it asks one more question than the constructor does.
 navSystem.TryInstallAbstractGraphIfBeneficial(out FP64 cellSize);
 ```
 
-**Calling that moves this game's navigation fingerprint, and its existing replays stop loading.**
-That is the cost the engine will not pay on your behalf: nothing installs a graph automatically,
-precisely so the moment it happens is one you chose. On a mesh under both thresholds the call
-answers `NotNeeded`, installs nothing, and the fingerprint does not move — so adding the line to a
-small stage costs nothing at all.
+**The constructor and this call do not ask the same thing.** The constructor asks only whether a flat
+search can run out of budget; the call asks that *and* whether a corridor can be clamped, because it
+defaults to `exhaustionOnly: false`. So there is a band of mesh sizes where the automatic install
+declines and this call does not, and in that band the line above is the only way to get legs:
+
+| triangles | the constructor | `TryInstallAbstractGraphIfBeneficial` |
+|---|---|---|
+| ≤ `CorridorCap` (128) | nothing | `NotNeeded` — the fingerprint does not move |
+| **129 – 4096** | **nothing** — it does not ask about the clamp | **`Installed`** — the only way in |
+| > `MaxIterations` (4096) | installs | `AlreadyInstalled` — a no-op, the graph is already there |
+
+**Where the call still installs, it moves this game's navigation fingerprint and its existing replays
+stop loading.** Past the search budget that cost was already paid, once, by 0.13 turning the automatic
+install on; in the band between the two lines it has not been paid and this call is what pays it. On a
+mesh under both thresholds the call answers `NotNeeded`, installs nothing, and the fingerprint does not
+move — so adding the line to a small stage costs nothing at all.
 
 **Every outcome is logged, including the ones where nothing happens** — a game reads this decision from its boot log, and a branch that stays silent cannot be told apart from the call not having run. A small stage prints `planning in legs: off — not needed. 116 triangles is within both the corridor cap (128) and the search budget (4096)…`; a large one prints the cell size the ladder settled on, the node counts, which threshold was crossed, and the new fingerprint.
 
 The four outcomes are separate because they call for different responses: `Installed`, `NotNeeded`
-(the mesh cannot reach either failure), `AlreadyInstalled` (you picked your own cell size and it was
-left alone), `NoCellSizeFits` (no rung of the ladder produced nodes inside the corridor cap —
+(the mesh cannot reach either failure), `AlreadyInstalled` (a graph is already there and was left
+alone — since 0.13 that is usually the constructor's own automatic install rather than a cell size
+you picked), `NoCellSizeFits` (no rung of the ladder produced nodes inside the corridor cap —
 returned as a value, never thrown, because this runs on the initialization path). The chosen cell
 size comes back out so a tool can draw the same partition and another peer can rebuild the identical
 graph.
@@ -860,6 +905,13 @@ navSystem.SetAbstractGraph(graph);       // null turns it back off
 `MaxNodeDiameter`, `MaxLegCorridorTriangles`, `NodeComponentCount` and `Checksum` to tune it. The node and edge accessors stay internal — they are the
 representation rather than a format. A swap rebinds the graph along with the query, pathfinder and
 funnel, so hand it over once and leave it alone.
+
+**Installing a graph drops whatever was prepared for the one it replaces.** A game that rebakes at
+runtime has the engine building the next graph a frame ahead (below). That spare is built to the
+*outgoing* graph's cell size, cost fold and mask, and its cell size cannot be repointed — so a later
+swap adopting it would quietly put the old cell size back, on the machines that happened to prepare
+and not on the ones that did not. Handing a graph over therefore discards the prepared one, and the
+next frame prepares again at the new build identity.
 
 **`SetAbstractGraph` refuses two things rather than letting them run.** A graph derived from a
 different mesh (node ids index that mesh's triangles, so the route would run through geometry that is
@@ -878,6 +930,18 @@ diameter against the cap directly is off by exactly that two.
 The measure is a double sweep — exact on a tree, a lower bound otherwise — so it catches a cell size
 that is clearly too large rather than proving the cap can never be reached;
 `DebugCorridorTruncatedCount` stays the runtime net for whatever slips through.
+
+**The derivation also reports what it found in the mesh.** Two things it can neither fix nor hide:
+
+- **Ground that costs less than the distance across it.** `FPNavAbstractCostFold.Min` prices a node
+  by its cheapest triangle, which keeps the route estimate conservative — but only while no triangle
+  is *cheaper* than plain distance to cross. Nothing bounds `costMultiplier`, and a road authored at
+  0.5 is ordinary, so the derivation counts such triangles and warns once when it finds any: from
+  there the estimate is no longer conservative and a first hop may not be the best one.
+- **Triangles that disagree about who their neighbours are.** The bake pairs both sides of a shared
+  edge in one step, so a mesh Klotho built cannot be one-directional about it; a hand-made or
+  third-party one can, and nothing checks it on load. The in-node walk skips such a pair and the
+  derivation logs an error with the count, rather than throwing from inside a mesh swap.
 
 **Decide from the mesh, not from taste — and there are two lines, not one.** A corridor cannot hold
 more triangles than the mesh has, and A* cannot expand more than it has either, so both failures have
@@ -898,10 +962,12 @@ instance handed a different tuning still compiles against them.
 Necessary is not sufficient. Past either line the failure becomes *reachable*; whether an actual
 route reaches it depends on the shape of the mesh.
 
-`TryInstallAbstractGraphIfBeneficial` answers both and logs which one was true. Brawler's own stages
-are 116 and 60 triangles, so it declines there and the sample keeps the call as documentation — it
-turns itself on if a stage ever grows past a line, and says so when it does. Read the base mesh, not
-the rebaked one: the decision has to be identical on every peer and stay put for the match.
+`TryInstallAbstractGraphIfBeneficial` answers both and logs which one was true; the constructor asks
+only the second and logs which one it asked. Brawler's own stages are 116 and 60 triangles, so both
+answer `NotNeeded` — the sample has no call left, only a comment where one used to be, because the
+constructor makes the decision now and says so in the boot log. A stage that grows past a line gets a
+graph on the next boot, and that stage's older replays stop loading. Read the base mesh, not the
+rebaked one: the decision has to be identical on every peer and stay put for the match.
 
 **When it does install, the cell size is searched rather than guessed.** Node width scales with cell
 size and local triangle density, and density varies by an order of magnitude between assets, so no
@@ -935,7 +1001,9 @@ larger cell — because the radius is a property of how your units move.
 
 A game that rebakes at runtime rebuilds this graph on every swap, because it is derived from the
 mesh. You do not have to arrange anything for that: the engine builds the new graph a frame before
-the swap and the swap adopts it, so the cost stays off the tick.
+the swap and the swap adopts it, so the cost stays off the tick — and from the second rebake on,
+the new graph copies the rows of every node the rebake left alone from the graph it replaces, so a
+one-building rebake on the Field derives in ~11 ms at cell 32 instead of ~44.
 [Navigation.Rebake.md § 8](./Navigation.Rebake.md#8-performance) has the measured numbers and the
 two cases where a swap still rebuilds on the spot.
 
@@ -1135,4 +1203,4 @@ each one per instance (blank = not settable).
 
 ---
 
-*Last updated: 2026-09-06 (0.12.1) — the endpoint lookup `FindPath` uses is public and documented (`FindTriangleForEndpoint`, tie broken toward allowed ground on the same surface only), the filtered lookups gained the height-aware `FindPassableTriangleForEndpoint`, `FPNavPathFailure` names why an agent will not move, and the navigation fingerprint now folds a behaviour revision and the tuning digest — with a replay checked against it at `StartReplay`. (2026-09-05 — the navigation caps became per-instance values: `FPNavTuning` is an optional constructor argument on the query, pathfinder, funnel, avoidance and agent system (defaults unchanged, validated at construction, immutable afterwards), the constants stay as those defaults, and `NavCorridorHelper.SetCorridor` now reports what it dropped through `DebugCorridorCopyTruncatedCount` — where 0 is the only correct value. (2026-09-04 (0.12.0) — `FPNavMeshPlacementProbe` and `FPNavMeshAreas` added to the component list and file layout, the NavMesh visualizers gained a building-placement tool on both editors, and ORCA now treats an agent standing exactly on an obstacle corner as an ordinary position. (2026-09-03 — an agent standing on ground its mask forbids can now leave it (the start is exempt in `FindPath`, and both the walk and the A\ expand a refused neighbour when the triangle they expand from is refused too; `DebugMaskedStartCount` reports it, and `Blocked` now requires that the agent actually asked to move), per-agent area masks (`PlanAreaMaskOverride`/`WalkAreaMaskOverride`, zero = no override, `SetAreaMask`, `FPNavAgentStatus.Blocked`) and, earlier the same day, the building area: `FPNavMeshAreas` (index 1 reserved and stamped onto retained footprints), `DEFAULT_AREA_MASK` now excludes it, and `DebugAreaMaskRejectedCount` can move through the agent path. (2026-09-02 — crowd scaling: a worked spatial partitioner (`FPNavAgentClusterSplitSampleTests`) with the three details that make it safe to copy; the four measured costs of a move order at 64/256/800/3200 agents, the cluster-split call pattern and its sweep, the determinism rules the partition has to meet, and the three diagnostic counters that make the caps visible (`MAX_AGENTS` and `BFS_FRONTIER_CAP` added to the constants table). (2026-08-18: the rebake driver is self-wiring: registering the system is the whole wiring, and `KlothoEngine` owns slice pacing plus the corrections at world init and after a full-state apply; `FPNavMeshPlacementValidator` gives the command path the driver’s own derivation, order and audits. (2026-08-17: delayed install: `FPNavMeshRebakeDriver` derives the installed mesh from frame state each tick (rollback-safe), time-sliced rebake across frames, two-mesh boundary cache, `FPNavAgentInstaller` swap/reseed protocol.) (2026-08-12: runtime NavMesh rebake (deterministic re-triangulation from building footprints, shape catalog, placement grid) — see [Navigation.Rebake.md](Navigation.Rebake.md).) (2026-07-23: graph-local obstacle query (BFS multi-floor/ramp, bake-slope climb cap), clearance tuning (`ObstacleRadiusInset` auto-applied from the recorded bake-settings block), position-correction pass, non-convex/dual-source extraction.) (2026-07-22: ORCA static obstacles — hard-constraint LP3, `FPNavMeshObstacleExtractor`, `LoadNavMeshObstacles()`, `MAX_OBST_LINES`.)))*
+*Last updated: 2026-09-09 (0.14.0) — hops between a route's two ends are priced portal to portal from a table derived with the graph (one value per portal pair, read both ways), a node's entry is chosen by the best estimate through it, and a leg aims three crossings ahead; installing a graph now discards whatever the engine had prepared for the one it replaces; and the derivation reports two things it finds in a mesh — ground cheaper than the distance across it, and triangles that disagree about their neighbours. (2026-09-08 (0.13.0) — planning in legs and partial paths, both on by default. (2026-09-06 (0.12.1) — the endpoint lookup `FindPath` uses is public and documented (`FindTriangleForEndpoint`, tie broken toward allowed ground on the same surface only), the filtered lookups gained the height-aware `FindPassableTriangleForEndpoint`, `FPNavPathFailure` names why an agent will not move, and the navigation fingerprint now folds a behaviour revision and the tuning digest — with a replay checked against it at `StartReplay`. (2026-09-05 — the navigation caps became per-instance values: `FPNavTuning` is an optional constructor argument on the query, pathfinder, funnel, avoidance and agent system (defaults unchanged, validated at construction, immutable afterwards), the constants stay as those defaults, and `NavCorridorHelper.SetCorridor` now reports what it dropped through `DebugCorridorCopyTruncatedCount` — where 0 is the only correct value. (2026-09-04 (0.12.0) — `FPNavMeshPlacementProbe` and `FPNavMeshAreas` added to the component list and file layout, the NavMesh visualizers gained a building-placement tool on both editors, and ORCA now treats an agent standing exactly on an obstacle corner as an ordinary position. (2026-09-03 — an agent standing on ground its mask forbids can now leave it (the start is exempt in `FindPath`, and both the walk and the A\ expand a refused neighbour when the triangle they expand from is refused too; `DebugMaskedStartCount` reports it, and `Blocked` now requires that the agent actually asked to move), per-agent area masks (`PlanAreaMaskOverride`/`WalkAreaMaskOverride`, zero = no override, `SetAreaMask`, `FPNavAgentStatus.Blocked`) and, earlier the same day, the building area: `FPNavMeshAreas` (index 1 reserved and stamped onto retained footprints), `DEFAULT_AREA_MASK` now excludes it, and `DebugAreaMaskRejectedCount` can move through the agent path. (2026-09-02 — crowd scaling: a worked spatial partitioner (`FPNavAgentClusterSplitSampleTests`) with the three details that make it safe to copy; the four measured costs of a move order at 64/256/800/3200 agents, the cluster-split call pattern and its sweep, the determinism rules the partition has to meet, and the three diagnostic counters that make the caps visible (`MAX_AGENTS` and `BFS_FRONTIER_CAP` added to the constants table). (2026-08-18: the rebake driver is self-wiring: registering the system is the whole wiring, and `KlothoEngine` owns slice pacing plus the corrections at world init and after a full-state apply; `FPNavMeshPlacementValidator` gives the command path the driver’s own derivation, order and audits. (2026-08-17: delayed install: `FPNavMeshRebakeDriver` derives the installed mesh from frame state each tick (rollback-safe), time-sliced rebake across frames, two-mesh boundary cache, `FPNavAgentInstaller` swap/reseed protocol.) (2026-08-12: runtime NavMesh rebake (deterministic re-triangulation from building footprints, shape catalog, placement grid) — see [Navigation.Rebake.md](Navigation.Rebake.md).) (2026-07-23: graph-local obstacle query (BFS multi-floor/ramp, bake-slope climb cap), clearance tuning (`ObstacleRadiusInset` auto-applied from the recorded bake-settings block), position-correction pass, non-convex/dual-source extraction.) (2026-07-22: ORCA static obstacles — hard-constraint LP3, `FPNavMeshObstacleExtractor`, `LoadNavMeshObstacles()`, `MAX_OBST_LINES`.)))))*

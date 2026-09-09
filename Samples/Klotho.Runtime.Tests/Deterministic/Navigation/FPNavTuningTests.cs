@@ -240,11 +240,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 FPNavAgentSystem.DEFAULT_AREA_MASK);
             system.SetAbstractGraph(graph);
 
-            Assert.AreEqual(0x3E8EB5BA08262583UL, graph.Checksum,
+            Assert.AreEqual(0xE45B6650A2F464E8UL, graph.Checksum,
                 "the derivation fold — moves if any pass changes");
             // 0x0EB1B717929327D2 before 0.13; moved by exactly the partial-path term when the
-            // default flipped, and by nothing else — the checksum above did not move.
-            Assert.AreEqual(unchecked((long)0x938AC839CEF93C95UL), system.GetNavFingerprint(),
+            // default flipped. 0x938AC839CEF93C95 until rule revision 6, which moved the checksum
+            // above (pair-table costs, node centres gone) and this with it — on purpose, once.
+            Assert.AreEqual(unchecked((long)0x495F1BD3642B7DFEUL), system.GetNavFingerprint(),
                 "what a peer REFUSES on — a change that moved only the checksum above would be a "
                 + "silent divergence between peers built either side of it");
         }

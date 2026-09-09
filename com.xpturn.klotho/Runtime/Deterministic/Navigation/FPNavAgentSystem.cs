@@ -256,6 +256,26 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// </summary>
         public int DebugGraphInstancesCreated => _graphInstancesCreated;
 
+        private int _ladderProbes;
+        private int _ladderPairTablesBuilt;
+
+        /// <summary>
+        /// Diagnostic: cell sizes the install ladder has derived a graph for, over this system's
+        /// lifetime (the ladder runs in the constructor when the tuning asks for it, and on every
+        /// <see cref="TryInstallAbstractGraphIfBeneficial"/>). Cumulative — a test that calls the
+        /// ladder more than once reads the difference.
+        /// </summary>
+        public int DebugLadderProbes => _ladderProbes;
+
+        /// <summary>
+        /// Diagnostic: how many graphs the ladder actually BUILT — the ones that fit the corridor
+        /// cap, which is at most one per ladder run. Every other candidate is only measured
+        /// (<c>FPNavAbstractGraph.MeasureLegCorridorTriangles</c>), so on a mesh where the ladder
+        /// has to step down the difference from <see cref="DebugLadderProbes"/> is what the boot
+        /// no longer pays for.
+        /// </summary>
+        public int DebugLadderPairTablesBuilt => _ladderPairTablesBuilt;
+
         /// <summary>
         /// Derives, ahead of time and OFF the deterministic path, the graph a coming navmesh swap
         /// will need. <b>Call it from the frame heartbeat</b> — the same place the host drives
@@ -263,8 +283,10 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// <c>PeekPreparedMesh</c>. Nulls and repeats are free.
         ///
         /// <para><b>What it buys.</b> A swap otherwise re-derives the whole graph inside the tick;
-        /// measured at 10.15 ms on the Field asset at the cell size the install ladder picks, against
-        /// the 2.13 ms budget a sliced rebake exists to hold. The derivation is a pure function of
+        /// measured at 41 ms on the Field asset at the cell size the install ladder picks (cell 32,
+        /// Release, tiered compilation off — the pair table is most of it; it was 10 ms before hops
+        /// were priced portal to portal and 83 ms before that table learned to look distances up),
+        /// against the 2.13 ms budget a sliced rebake exists to hold. The derivation is a pure function of
         /// (mesh, cell size, cost fold, area mask), so doing it early changes nothing about the
         /// result — only when the clock is spent.</para>
         ///
@@ -303,7 +325,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             }
             else
             {
-                _spareGraph.Rebind(mesh);
+                // The live graph donates: every node whose surroundings the rebake left alone takes
+                // its pair-table rows from it instead of walking them again (FPNavAbstractGraph.Rebind).
+                // The result is the same graph to the bit — the donor moves the clock, never a
+                // value — and the live graph is only read. Measured on the Field's rebake meshes at
+                // cell 32: 43.6 ms plain, 10.8 with the donor, one building per rebake.
+                _spareGraph.Rebind(mesh, _abstractGraph);
             }
 
             _preparedMesh = mesh;
@@ -591,6 +618,19 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                         $"it just discarded.");
                 }
             }
+
+            // The prepared spare was built to the OUTGOING graph's build identity, and _cellSize is
+            // readonly there — Rebind cannot repair it. Left in place it is adopted at the next swap,
+            // so this system would run the old cell size while a peer that never prepared derives at
+            // the new one: a fingerprint split after Ready has already passed. _preparedMesh goes with
+            // it, because PrepareAbstractGraphFor returns early on that reference before it reaches
+            // anything that could notice the mismatch.
+            if (!ReferenceEquals(_abstractGraph, graph))
+            {
+                _spareGraph = null;
+                _preparedMesh = null;
+            }
+
             _abstractGraph = graph;
         }
 
@@ -759,12 +799,19 @@ namespace xpTURN.Klotho.Deterministic.Navigation
 
             while (true)
             {
-                var graph = new FPNavAbstractGraph(_navMesh, candidate, costFold, areaMask, _logger);
+                // Measure first: a candidate is rejected on its diameter alone, and measuring is
+                // the partition and that diameter — a few percent of a derivation. Only the one
+                // that fits is built, and it is built by the ordinary constructor, so nothing here
+                // ever holds a graph that is missing its edges or its pair table.
+                int corridor = FPNavAbstractGraph.MeasureLegCorridorTriangles(
+                    _navMesh, candidate, costFold, areaMask);
                 probes++;
+                _ladderProbes++;
 
-                if (graph.MaxLegCorridorTriangles <= _tuning.CorridorCap)
+                if (corridor <= _tuning.CorridorCap)
                 {
-                    chosen = graph;
+                    chosen = new FPNavAbstractGraph(_navMesh, candidate, costFold, areaMask, _logger);
+                    _ladderPairTablesBuilt++;
                     break;
                 }
 
@@ -810,7 +857,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             _logger?.KInformation(
                 $"[FPNavAgentSystem] {who} at cell {candidate.ToDouble():F2} " +
                 $"({probes} derivation(s) on the ladder from {floor.ToDouble():F2} x " +
-                $"{LEG_CELL_LADDER_START_MULTIPLE}): {chosen.NodeCount} nodes, {chosen.EdgeCount} " +
+                $"{LEG_CELL_LADDER_START_MULTIPLE}, the pair table only for this one): {chosen.NodeCount} nodes, {chosen.EdgeCount} " +
                 $"edges, widest node {chosen.MaxNodeDiameter} hops across " +
                 $"({chosen.MaxLegCorridorTriangles} corridor triangles) against cap " +
                 $"{_tuning.CorridorCap}. {why}. Navigation fingerprint is now " +
@@ -847,13 +894,21 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         private int _legAdvanceRepeatCount;
 
         /// <summary>
-        /// Diagnostic: plans that asked for the crossing the agent had just finished, and were sent
-        /// on to the next one instead. Reaching a portal does not put the agent past it — the portal
+        /// Diagnostic: crossings a plan asked for that the agent had already finished, skipped in
+        /// favour of the next one. Reaching a portal does not put the agent past it — the portal
         /// IS the shared edge — so the node it stands in has not changed yet and the abstract search
         /// would otherwise hand back the same hop.
         ///
-        /// <para>Expect roughly one per leg: it is the normal cost of a boundary being a line rather
-        /// than a region. What it must NOT do is stay at zero while <see cref="DebugLegAdvanceCount"/>
+        /// <para><b>Expect exactly two per leg, everywhere</b> — not "roughly one, two at a lattice
+        /// corner", which is what this said before it was measured. Both skips fire on every plan
+        /// after the first, because the second reach test compares against
+        /// <see cref="NavAgentComponent.PathTarget"/>, which after any successful plan holds the
+        /// crossing this leg is walking toward; the plan that follows the hand-off asks for that
+        /// same crossing or its neighbour and is inside that ball by construction. Measured on open
+        /// ground at cell 4, 8 and 16 and reach radius 2.5 to 100, the ratio to
+        /// <see cref="DebugLegAdvanceCount"/> was 2.0 in every configuration.</para>
+        ///
+        /// <para>What it must NOT do is stay at zero while <see cref="DebugLegAdvanceCount"/>
         /// runs several times the number of nodes on the route — that was the shape of the defect
         /// this replaced, where the agent circled at each boundary until it drifted across.</para>
         /// </summary>
@@ -1188,7 +1243,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
         /// reference can be recycled and rewritten. Adopting on identity alone would then install a
         /// graph indexing geometry that is no longer there — and every peer would do it identically,
         /// so the state hash would agree and nothing would report it. The fingerprint is a fold over
-        /// the mesh; against a 10 ms derivation it is free.</item>
+        /// the mesh; against a 40 ms derivation it is free.</item>
         /// </list>
         ///
         /// <para>On adoption the outgoing graph becomes the spare, so the pair alternates and no
@@ -1233,11 +1288,12 @@ namespace xpTURN.Klotho.Deterministic.Navigation
                 // sits outside this branch rather than inside either arm of it.
                 if (!TryAdoptPreparedGraph(newMesh))
                 {
-                    // The whole derivation, on the deterministic command path. Measured at 10.15 ms
-                    // on the Field asset at the cell size the install ladder picks (Release),
-                    // against the ~2 ms that time-slicing the rebake itself works to stay inside —
-                    // roughly five times the budget it lands in. Timing it is opt-in; counting is
-                    // not.
+                    // The whole derivation, on the deterministic command path. Measured at 41 ms
+                    // on the Field asset at the cell size the install ladder picks (cell 32,
+                    // Release, tiered compilation off; the pair table is most of it — 10 ms before
+                    // hops were priced portal to portal), against the ~2 ms that time-slicing the
+                    // rebake itself works to stay inside — roughly twenty times the budget it lands
+                    // in. Timing it is opt-in; counting is not.
                     long startTicks = DebugTimeGraphDerivation
                         ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
@@ -1302,7 +1358,27 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             LoadNavMeshObstacles();
 
             _logger?.KInformation($"[FPNavAgentSystem] navmesh swapped: {newMesh.Triangles.Length} triangles, " +
-                $"fingerprint 0x{GetNavFingerprint():X16}");
+                $"fingerprint 0x{GetNavFingerprint():X16}{DonorClause(_abstractGraph)}");
+        }
+
+        /// <summary>
+        /// What the prepared graph did with the donor it was offered, as a clause for the swap line.
+        /// A refusal is otherwise invisible: the reason is an internal string with no reader, and a
+        /// silently refused donor costs the full derivation with nothing but the missing clause to
+        /// say so. No line of its own — an RTS re-bakes once per placement, so one per re-bake is
+        /// spam (Plan-IncrementalRederive, change 4). Built inside the interpolation hole, so a
+        /// disabled log level allocates nothing.
+        /// </summary>
+        private static string DonorClause(FPNavAbstractGraph graph)
+        {
+            if (graph == null)
+                return "";
+            if (graph.DebugRebindDonorUsed)
+                return $"; the prepared graph took {graph.DebugRebindNodesReused} of " +
+                    $"{graph.NodeCount} nodes' rows from the previous one";
+            if (graph.DebugRebindDonorIgnored != null)
+                return $"; the prepared graph reused nothing — {graph.DebugRebindDonorIgnored}";
+            return "";
         }
 
         /// <summary>
@@ -1829,7 +1905,7 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             // node's boundary, about as far from that centre as it gets.
             if (!_abstractGraph.TryFindFirstHop(
                     startNode, goalNode, nav.Position.ToXZ(), nav.Destination.ToXZ(),
-                    out int edge, out int nextEdge))
+                    out int edge, out int nextEdge, out int thirdEdge))
             {
                 // No node route at all. The triangle search never runs, so its budget counter stays
                 // clean — this is the only place the failure is visible.
@@ -1842,31 +1918,86 @@ namespace xpTURN.Klotho.Deterministic.Navigation
             // portal after this one when there is one, and the destination when this hop is the
             // last: the destination can point clean out of the next node, and steering at it would
             // hug a corner the route then has to come back around.
-            FPVector2 beyond = nextEdge >= 0
-                ? _abstractGraph.EdgePortal(nextEdge).ToXZ()
-                : nav.Destination.ToXZ();
-            FPVector3 aim = _abstractGraph.AimPointOn(edge, nav.Position.ToXZ(), beyond);
-
-            // The crossing we have ALREADY made. A leg ends when the agent reaches its portal, but
-            // the triangle it stands on at that moment is still on the near side of the boundary —
-            // the portal is the shared edge, and arriving at it does not put the agent past it. The
-            // abstract search then starts from the same node and hands back the same crossing, whose
-            // aim point is where the agent is standing, so the leg ends again on the next tick. The
-            // hand-off keeps the agent's velocity, so this does not stall: it circles.
+            //
+            // But first, the crossing we have ALREADY made. A leg ends when the agent reaches its
+            // portal, but the triangle it stands on at that moment is still on the near side of the
+            // boundary — the portal is the shared edge, and arriving at it does not put the agent
+            // past it. The abstract search then starts from the same node and hands back the same
+            // crossing, whose aim point is where the agent is standing, so the leg ends again on the
+            // next tick. The hand-off keeps the agent's velocity, so this does not stall: it circles.
             //
             // Measured before this guard: 66 leg advances over a route that changes node 17 times —
             // 49 of them repeats in a node the agent had not left. Aiming at what comes AFTER the
             // crossing is what carries it through.
+            //
+            // Two more shapes of the same repeat, both from pricing hops portal to portal (rule
+            // revision 6). A plan made from a slightly different position can come back with the
+            // NEIGHBOUR of the crossing just made — a portal a unit along the same boundary, whose
+            // aim sits just outside the reach ball but within it of the SECOND reference point
+            // below. And where the route passes a lattice corner, the first two crossings meet
+            // there and the agent can be within reach of both: skipping only the first handed it a
+            // leg that ended on the tick it was planned, every tick until it had physically crossed
+            // (measured: 45 such legs on a 3×3-node field walked corner to corner).
+            //
+            // WHAT THIS ACTUALLY DOES, measured. Read as written the loop below is a ladder that
+            // skips leading crossings until one falls outside the ball. It does not behave like
+            // one: counting which rung returns, over six open-field runs (cell 4/8/16, reach 2.5 to
+            // 100), the FIRST rung returned exactly once per journey — the opening plan — the
+            // second returned NEVER, and every other plan skipped twice and returned the third aim
+            // below without a reach test. So this is not "skip what was already crossed"; it is a
+            // fixed three-hop lookahead, and the two reach tests are true by construction after the
+            // first plan.
+            //
+            // The reason is the second reference point. lastLegEndXZ reads nav.PathTarget, which is
+            // written only on a successful plan (below) and therefore holds the crossing this leg
+            // is walking TOWARD, not where the last one ended. The plan that follows a hand-off asks
+            // for that same crossing or its neighbour, which is inside that ball by construction —
+            // so rungs one and two always skip. That is load-bearing rather than a defect: removing
+            // the term doubles the number of legs on the same journey (the travel time is
+            // unchanged, so it is pure planning cost) and introduces leg targets reached on the
+            // plan tick. It is also harmless where it is theoretically wrong — the value is
+            // FPVector3.Zero before the first plan, and over seventeen runs on a field centred on
+            // the world origin, walking both toward it and away, that zero decided a skip zero
+            // times: the term is only consulted on a plan, and the first aim is always a node ahead
+            // of the agent, so "aim within reach of the origin while the agent is not" did not
+            // occur. Renaming the field would say what it is; changing it would cost the above.
+            //
+            // The third aim is returned without a test, which is where the ladder ends today.
+            // Measured, that is harmless at a sane reach radius (it was never inside the ball) and
+            // makes no difference at a wide one (everything is inside the ball, so testing it would
+            // return the same point anyway). What DOES go wrong at a wide radius is the hand-off
+            // itself — see WarnLegReachRadiusOnce, which is the honest place for it.
             _lastLegPlanKind = LegPlanKind.Legs;
-            if (FPVector2.Distance(nav.Position.ToXZ(), aim.ToXZ()) < ReachRadius(nav))
-            {
-                _legAdvanceRepeatCount++;
-                return nextEdge >= 0
-                    ? _abstractGraph.AimPointOn(nextEdge, nav.Position.ToXZ(), nav.Destination.ToXZ())
-                    : nav.Destination;
-            }
-            return aim;
+            FP64 reach = ReachRadius(nav);
+            FPVector2 posXZ = nav.Position.ToXZ();
+            FPVector2 lastLegEndXZ = nav.PathTarget.ToXZ();
+            FPVector2 destXZ = nav.Destination.ToXZ();
+
+            FPVector2 beyond = nextEdge >= 0 ? _abstractGraph.EdgePortal(nextEdge).ToXZ() : destXZ;
+            FPVector3 aim = _abstractGraph.AimPointOn(edge, posXZ, beyond);
+            if (!WithinReach(aim.ToXZ(), posXZ, lastLegEndXZ, reach))
+                return aim;
+            _legAdvanceRepeatCount++;
+            if (nextEdge < 0)
+                return nav.Destination;
+
+            beyond = thirdEdge >= 0 ? _abstractGraph.EdgePortal(thirdEdge).ToXZ() : destXZ;
+            aim = _abstractGraph.AimPointOn(nextEdge, posXZ, beyond);
+            if (!WithinReach(aim.ToXZ(), posXZ, lastLegEndXZ, reach))
+                return aim;
+            _legAdvanceRepeatCount++;
+            if (thirdEdge < 0)
+                return nav.Destination;
+
+            return _abstractGraph.AimPointOn(thirdEdge, posXZ, destXZ);
         }
+
+        /// <summary>
+        /// Whether a crossing's aim point counts as already made: within the hand-off radius of the
+        /// agent, or of where its last leg ended (see the guard in <see cref="ResolveLegTarget"/>).
+        /// </summary>
+        private static bool WithinReach(FPVector2 aim, FPVector2 pos, FPVector2 lastLegEnd, FP64 reach)
+            => FPVector2.Distance(pos, aim) < reach || FPVector2.Distance(lastLegEnd, aim) < reach;
 
         private unsafe void ProcessPathRequest(ref NavAgentComponent nav, int currentTick)
         {

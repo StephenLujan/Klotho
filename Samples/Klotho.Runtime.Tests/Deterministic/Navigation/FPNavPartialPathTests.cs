@@ -783,7 +783,11 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         public void WithAGraph_AnExhaustedLegSearch_GetsAPartial_NotTheFlatFallback()
         {
             var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(32);
-            var tuning = new FPNavTuning(maxIterations: 64, partialPathOnExhaustion: true);
+            // 24, not 64: since the abstract search prices hops from the entry portal (rule
+            // revision 6) the first leg aims at the straight-line crossing near the node corner,
+            // a ~40-unit diagonal that 64 iterations can finish. The fixture is about a leg that
+            // EXHAUSTS, so the budget sits well below what that leg needs.
+            var tuning = new FPNavTuning(maxIterations: 24, partialPathOnExhaustion: true);
             var system = MakeSystem(mesh, tuning, out var pathfinder);
             system.SetAbstractGraph(new FPNavAbstractGraph(mesh, FP64.FromInt(32), FPNavAbstractCostFold.Min, FPNavAgentSystem.DEFAULT_AREA_MASK));
             var (frame, entity, entities) = Agent(mesh, NavAgentTestHelper.CellCenter(1, 1), NavAgentTestHelper.CellCenter(30, 30));

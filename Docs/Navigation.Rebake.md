@@ -977,12 +977,14 @@ across the slices:
 
 | Asset | Triangles | Derivation | Against the 2.13 ms slice budget |
 | --- | ---: | ---: | --- |
-| **Field** | 22,321 | **10.15 ms** | **~5× over** |
+| **Field** | 22,321 | **43.6 ms** plain · **10.8 ms** from the second rebake on | **~20× / ~5× over** |
 | Stage01 | 116 | 0.09 ms | comfortable |
 | Stage02 | 60 | 0.06 ms | comfortable |
 
-Field's figure is at cell 32, the size the install helper settles on for that asset; a smaller cell
-costs more (13.4 ms at 16, 46.1 ms at 4). All three are Release builds.
+Field's figures are at cell 32, the size the install helper settles on for that asset, on its
+rebaked mesh (Release, tiered compilation off); the plain derivation is what the first rebake of a
+match costs, and every rebake after it copies the pair-table rows of the nodes it left alone from
+the graph it replaces (cell 16: 52.2 → 7.7 ms). The swap log says how many nodes' rows it took.
 
 **That cost no longer lands on the swap frame, and you do not have to do anything to avoid it.**
 The engine builds the graph one frame boundary earlier, from the mesh the rebake driver already
@@ -1278,8 +1280,9 @@ a null check at each of those points; a game that registers one cannot pace slic
 
 Installing a mesh makes some things stale that are neither state nor cheap. The one this seam exists
 for is the abstract graph behind [planning in legs](Navigation.md): a swap re-derives it whole, on
-the deterministic command path, and that costs **10.15 ms on the Field asset at the cell size the
-install helper picks** — against the 2.13 ms this driver's slicing works to stay inside.
+the deterministic command path, and that costs **43.6 ms on the Field's rebaked mesh at the cell
+size the install helper picks** (10.8 ms from the second rebake on, when the previous graph donates
+its rows) — against the 2.13 ms this driver's slicing works to stay inside.
 
 It does not have to be paid there. The graph is a pure function of `(mesh, cell size, cost fold,
 area mask)`, so it can be built the moment the mesh exists — one frame boundary earlier, off the
@@ -1305,6 +1308,21 @@ be the one built for that instance; and because meshes are pooled and a commit r
 replaces, a reference can be recycled and rewritten — so the content is checked too. A graph over
 geometry that is no longer there would be installed identically on every peer, with the state hash
 agreeing and nothing reporting it.
+
+**What it does not check is the build identity, which is why installing your own graph clears it.**
+The spare is built to the cell size, cost fold and mask of the graph that was installed when it was
+prepared, and its cell size cannot be repointed afterwards. If a game hands over a graph of its own
+with `SetAbstractGraph` while a spare is standing by, adopting that spare later would put the old
+cell size back — and only on the machines that happened to prepare, which is the one difference this
+seam promises never to make. So installing a graph discards the prepared one, and the next frame
+prepares again.
+
+**A swap that could not reuse the rows says why.** Copying rows needs the previous graph to be of the
+same build identity and its mesh to still be the one it was derived over; when either fails, the swap
+log names the reason — a differing cell size, cost fold or mask; a mesh that has already been retired
+into the pool; or a mesh whose triangles reach more than half a cell from the point that places them,
+which is the condition the "only the eight cells around it" rule rests on — instead of reporting only
+the swaps that reused something.
 
 | Member | Purpose |
 | --- | --- |

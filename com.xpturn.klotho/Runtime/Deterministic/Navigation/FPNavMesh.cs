@@ -76,6 +76,15 @@ namespace xpTURN.Klotho.Deterministic.Navigation
 
         internal void MarkRetired() => _retired = true;
 
+        /// <summary>
+        /// True once the storage has gone back to the pool. Unlike the guard below this is readable
+        /// in every build, and unlike a fingerprint it stays true after the arrays have been
+        /// overwritten by their next owner — so a holder can ask whether what it kept still means
+        /// anything. Reading it touches no array, and therefore does not go through
+        /// <see cref="AssertLive"/>.
+        /// </summary>
+        internal bool IsRetired => _retired;
+
         [System.Diagnostics.Conditional("DEBUG")]
         private void AssertLive()
         {

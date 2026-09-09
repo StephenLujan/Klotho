@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using NUnit.Framework;
 
 using xpTURN.Klotho.ECS;
@@ -95,13 +96,18 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
         private static Crowd BuildCrowd(int count, bool avoidance, double abstractCell = 0)
         {
             var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
-            var system = NavAgentTestHelper.CreateSystem(mesh, null, out var pathfinder);
+            // Since 0.13 the default tuning installs a graph on a mesh this size by itself, so
+            // "flat" has to be asked for: the graph here is always the explicit one or none.
+            var system = NavAgentTestHelper.CreateSystem(
+                mesh, null, NavAgentTestHelper.NoAutoGraph, out var pathfinder);
             if (abstractCell > 0)
                 system.SetAbstractGraph(new FPNavAbstractGraph(
                     mesh, FP64.FromDouble(abstractCell), FPNavAbstractCostFold.Min,
                     FPNavAgentSystem.DEFAULT_AREA_MASK));
+            else
+                Assert.IsNull(system.AbstractGraph, "flat means no graph installed");
             if (avoidance)
-                system.SetAvoidance(new FPNavAvoidance());
+                system.SetAvoidance(new FPNavAvoidance(NavAgentTestHelper.NoAutoGraph));   // same tuning as the system
 
             int perRow = (int)System.Math.Ceiling(System.Math.Sqrt(count));
             var positions = new FPVector3[count];
@@ -413,15 +419,26 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 "by construction — the choice only bites on a mesh with area costs)");
         }
 
-        private static (string status, int ticks, double distance, int legs)
+        /// <summary>
+        /// One agent walks <paramref name="start"/> → <paramref name="goal"/>. <c>abstractCell</c> 0
+        /// is FLAT (no graph — asked for explicitly, since the default tuning would install one).
+        /// Besides the total, the walk is cut at every leg hand-off so the MIDDLE of the route —
+        /// first and last leg excluded — can be read on its own: the two ends are priced from the
+        /// agent's real position and destination and are nearly straight, so a total ratio dilutes
+        /// whatever the hops between them still cost (V-M0).
+        /// </summary>
+        private static (string status, int ticks, double distance, int legs,
+                double midDistance, double midStraight, double firstLeg, double lastLeg)
             WalkOne(FPVector3 start, FPVector3 goal, double abstractCell)
         {
             var mesh = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
-            var system = NavAgentTestHelper.CreateSystem(mesh, null);
+            var system = NavAgentTestHelper.CreateSystem(mesh, null, NavAgentTestHelper.NoAutoGraph, out _);
             if (abstractCell > 0)
                 system.SetAbstractGraph(new FPNavAbstractGraph(
                     mesh, FP64.FromDouble(abstractCell), FPNavAbstractCostFold.Min,
                     FPNavAgentSystem.DEFAULT_AREA_MASK));
+            else
+                Assert.IsNull(system.AbstractGraph, "flat means no graph installed");
 
             var query = new FPNavMeshQuery(mesh, null);
             int tri = query.FindTriangle(start.ToXZ(), start.y);
@@ -431,6 +448,9 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
 
             FPVector3 prev = start;
             double travelled = 0;
+            int legsSeen = 0;
+            FPVector3 firstHandoff = start, lastHandoff = start;
+            double travelledAtFirst = 0, travelledAtLast = 0;
             const int budget = 20000;
             for (int tick = 1; tick <= budget; tick++)
             {
@@ -439,12 +459,217 @@ namespace xpTURN.Klotho.Deterministic.Navigation.Tests
                 travelled += FPVector2.Distance(prev.ToXZ(), nav.Position.ToXZ()).ToDouble();
                 prev = nav.Position;
 
-                if (nav.Status == (byte)FPNavAgentStatus.Arrived)
-                    return ("Arrived", tick, travelled, system.DebugLegAdvanceCount);
-                if (nav.Status == (byte)FPNavAgentStatus.PathFailed)
-                    return ("PathFailed", tick, travelled, system.DebugLegAdvanceCount);
+                if (system.DebugLegAdvanceCount > legsSeen)
+                {
+                    legsSeen = system.DebugLegAdvanceCount;
+                    if (legsSeen == 1) { firstHandoff = nav.Position; travelledAtFirst = travelled; }
+                    lastHandoff = nav.Position;
+                    travelledAtLast = travelled;
+                }
+
+                if (nav.Status == (byte)FPNavAgentStatus.Arrived || nav.Status == (byte)FPNavAgentStatus.PathFailed
+                    || tick == budget)
+                {
+                    string status = nav.Status == (byte)FPNavAgentStatus.Arrived ? "Arrived"
+                        : nav.Status == (byte)FPNavAgentStatus.PathFailed ? "PathFailed" : "timeout";
+                    int legs = system.DebugLegAdvanceCount;
+                    double mid = legs >= 2 ? travelledAtLast - travelledAtFirst : 0;
+                    double midStraight = legs >= 2
+                        ? FPVector2.Distance(firstHandoff.ToXZ(), lastHandoff.ToXZ()).ToDouble() : 0;
+                    double lastLeg = legs >= 1 ? travelled - travelledAtLast : travelled;
+                    return (status, tick, travelled, legs, mid, midStraight, travelledAtFirst, lastLeg);
+                }
             }
-            return ("timeout", budget, travelled, system.DebugLegAdvanceCount);
+            return ("timeout", budget, travelled, system.DebugLegAdvanceCount, 0, 0, 0, 0);
+        }
+
+        #endregion
+
+        #region P0 — the middle ratio and the abstract-search baseline (Plan-MidHopEntryPoint)
+
+        private static string RepoRoot()
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "com.xpturn.klotho")))
+                dir = dir.Parent;
+            Assert.IsNotNull(dir, "repo root not found from test base directory");
+            return dir.FullName;
+        }
+
+        private const string FieldAsset = "Samples/Brawler/Assets/NavMesh/Data/Field.NavMeshData.bytes";
+
+        /// <summary>
+        /// V-M0 — the ratio of the MIDDLE of a route, first and last leg excluded. The two ends are
+        /// priced from the agent's position and the destination (the parent plan's endpoint
+        /// insertion), so they are nearly straight; the hops between them are still priced centre
+        /// to centre, and a total ratio hides what that costs. The middle ratio should sit ABOVE the
+        /// total and not improve with distance — if it does not, the plan's premise is wrong.
+        /// </summary>
+        [Test]
+        public void VM0_TheMiddleRatio_OffTheDiagonal()
+        {
+            TestContext.Out.WriteLine("=== V-M0 — middle ratio (first and last leg excluded), ~27 degrees ===");
+            TestContext.Out.WriteLine("");
+            foreach (int k in new[] { 12, 32, 44 })
+            {
+                FPVector3 start = NavAgentTestHelper.CellCenter(2, 2);
+                FPVector3 goal = NavAgentTestHelper.CellCenter(2 + 2 * k, 2 + k);
+                double straight = FPVector2.Distance(start.ToXZ(), goal.ToXZ()).ToDouble();
+                TestContext.Out.WriteLine($"--- k={k,3}  (straight line {straight:F1}) ---");
+                foreach (double cell in new[] { 0.0, 16.0, 32.0 })
+                {
+                    var r = WalkOne(start, goal, cell);
+                    string mid = r.legs >= 2 && r.midStraight > 0
+                        ? $"middle {r.midDistance / r.midStraight,6:F3}x over {r.midStraight,6:F1} ({r.legs - 1} legs)"
+                        : "middle    n/a";
+                    TestContext.Out.WriteLine(
+                        $"  {(cell == 0 ? "flat   " : $"cell {cell,4:F0}")}  {r.status,-11} " +
+                        $"total {r.distance / straight,6:F3}x  {mid}  first {r.firstLeg,5:F1}  last {r.lastLeg,5:F1}");
+                }
+                TestContext.Out.WriteLine("");
+            }
+        }
+
+        private static void ReportSearchCost(string name, FPNavMesh mesh, double cell)
+        {
+            var g = new FPNavAbstractGraph(mesh, FP64.FromDouble(cell), FPNavAbstractCostFold.Min,
+                FPNavAgentSystem.DEFAULT_AREA_MASK);
+            int triCount = mesh.Triangles.Length;
+            FPVector2 Centroid(int t)
+            {
+                var tri = mesh.Triangles[t];
+                return (mesh.Vertices[tri.v0].ToXZ() + mesh.Vertices[tri.v1].ToXZ() + mesh.Vertices[tri.v2].ToXZ())
+                    * (FP64.One / FP64.FromInt(3));
+            }
+
+            // Goal: the walkable triangle whose centroid has the largest x+z (a far corner, like PG).
+            int goalTri = -1; FP64 best = FP64.MinValue;
+            for (int t = 0; t < triCount; t++)
+            {
+                if (g.NodeOf(t) < 0) continue;
+                var c = Centroid(t);
+                if (c.x + c.y > best) { best = c.x + c.y; goalTri = t; }
+            }
+            int goalNode = g.NodeOf(goalTri);
+            FPVector2 goalXZ = Centroid(goalTri);
+
+            // Starts: 800 walkable triangles spread evenly over the mesh, not in the goal node.
+            var startNode = new List<int>(); var startXZ = new List<FPVector2>();
+            for (int t = 0; t < triCount && startNode.Count < 800; t += System.Math.Max(1, triCount / 900))
+            {
+                int n = g.NodeOf(t);
+                if (n < 0 || n == goalNode) continue;
+                startNode.Add(n); startXZ.Add(Centroid(t));
+            }
+            int count = startNode.Count;
+
+            int found = 0;
+            for (int i = 0; i < count; i++)
+                if (g.TryFindFirstHop(startNode[i], goalNode, startXZ[i], goalXZ, out _, out _, out _)) found++;
+
+            // Untimed pass: what a search does, read off the scratch after each one.
+            long relax = 0, closed = 0, touched = 0;
+            g.DebugCountMissedImprovements = true;      // untimed: the count costs a root per closed relaxation
+            int missedBefore = g.DebugMissedImprovements;
+            for (int i = 0; i < count; i++)
+            {
+                g.TryFindFirstHop(startNode[i], goalNode, startXZ[i], goalXZ, out _, out _, out _);
+                for (int n = 0; n < g.NodeCount; n++)
+                {
+                    if (!g.DebugSearchTouched(n)) continue;
+                    touched++;
+                    if (!g.DebugSearchClosed(n)) continue;
+                    closed++;
+                    g.EdgeRange(n, out int es, out int ee);
+                    relax += ee - es;
+                }
+            }
+            int missed = g.DebugMissedImprovements - missedBefore;
+            g.DebugCountMissedImprovements = false;
+
+            var batches = new List<double>();
+            var sw = new Stopwatch();
+            for (int b = 0; b < 20; b++)
+            {
+                sw.Restart();
+                for (int i = 0; i < count; i++)
+                    g.TryFindFirstHop(startNode[i], goalNode, startXZ[i], goalXZ, out _, out _, out _);
+                sw.Stop();
+                batches.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            batches.Sort();
+
+            // Portal length: the freedom a mid-point cost model gives away is half of this.
+            var lens = new List<double>(g.EdgeCount);
+            for (int e = 0; e < g.EdgeCount; e++)
+            {
+                g.EdgePortalSegment(e, out var a, out var bEnd);
+                lens.Add(FPVector2.Distance(a.ToXZ(), bEnd.ToXZ()).ToDouble());
+            }
+            lens.Sort();
+            long pairs = 0;
+            for (int n = 0; n < g.NodeCount; n++) { g.EdgeRange(n, out int es, out int ee); long d = ee - es; pairs += d * d; }
+
+            TestContext.Out.WriteLine(
+                $"{name,-12} cell {cell,3:F0}  {g.NodeCount,5} nodes {g.EdgeCount,6} edges ({(double)g.EdgeCount / g.NodeCount,5:F1}/node)  " +
+                $"{count} searches ({found} found): min {batches[0],7:F3} ms  median {batches[10],7:F3} ms  = {batches[0] * 1000 / count,6:F2} us/search");
+            TestContext.Out.WriteLine(
+                $"{"",-12}          per search: touched {(double)touched / count,6:F1}  closed {(double)closed / count,6:F1}  " +
+                $"relaxations {(double)relax / count,7:F1}  missed improvements {missed} (total over {count})");
+            TestContext.Out.WriteLine(
+                $"{"",-12}          portal length: median {lens[lens.Count / 2]:F2}  p99 {lens[(int)(lens.Count * 0.99)]:F2}  max {lens[lens.Count - 1]:F2}" +
+                $"  | pair table (sum outdeg^2) {pairs} entries = {pairs * 8 / 1024} KB");
+        }
+
+        private static void ReportArithmeticUnitCosts()
+        {
+            // Pseudo-random FP64 inputs from an LCG so nothing can be hoisted out of the loops.
+            const int N = 1_000_000; ulong seed = 12345;
+            FP64 Rnd() { seed = seed * 6364136223846793005UL + 1442695040888963407UL; return FP64.FromRaw((long)((seed >> 20) & 0xFFFFFFFFFUL)) - FP64.FromInt(2048); }
+            var ps = new FPVector2[4096]; var aa = new FPVector2[4096]; var bb = new FPVector2[4096];
+            for (int i = 0; i < 4096; i++)
+            {
+                ps[i] = new FPVector2(Rnd(), Rnd()); aa[i] = new FPVector2(Rnd(), Rnd());
+                bb[i] = aa[i] + new FPVector2(FP64.FromDouble(1.3), FP64.FromDouble(-0.7));
+            }
+            var table = new FP64[4096]; for (int i = 0; i < 4096; i++) table[i] = Rnd();
+            long acc = 0; var sw = new Stopwatch();
+            double tLookup = 0, tDist = 0, tCp = 0, tBoth = 0, tSqr = 0;
+            for (int rep = 0; rep < 3; rep++)
+            {
+                sw.Restart(); for (int i = 0; i < N; i++) { int k = i & 4095; acc += (table[k] + table[(k + 1) & 4095]).RawValue; } sw.Stop(); tLookup = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+                sw.Restart(); for (int i = 0; i < N; i++) { int k = i & 4095; acc += FPVector2.Distance(ps[k], aa[k]).RawValue; } sw.Stop(); tDist = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+                sw.Restart(); for (int i = 0; i < N; i++) { int k = i & 4095; acc += FPNavMeshQuery.ClosestPointOnSegment2D(ps[k], aa[k], bb[k]).x.RawValue; } sw.Stop(); tCp = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+                sw.Restart(); for (int i = 0; i < N; i++) { int k = i & 4095; var cp = FPNavMeshQuery.ClosestPointOnSegment2D(ps[k], aa[k], bb[k]); acc += FPVector2.Distance(ps[k], cp).RawValue; } sw.Stop(); tBoth = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+                sw.Restart(); for (int i = 0; i < N; i++) { int k = i & 4095; acc += FPVector2.SqrDistance(ps[k], aa[k]).RawValue; } sw.Stop(); tSqr = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+            }
+            TestContext.Out.WriteLine(
+                $"arithmetic ns/op: table lookup+add {tLookup:F1} | Distance (sqrt) {tDist:F1} | ClosestPointOnSegment2D {tCp:F1} | " +
+                $"closest+Distance {tBoth:F1} | SqrDistance {tSqr:F1}   (sink {acc & 1})");
+        }
+
+        /// <summary>
+        /// V-M3 baseline — what the abstract search costs today, per search and per 800, with the
+        /// counts that explain it (relaxations, closed, touched) and the unit cost of the arithmetic
+        /// a relaxation could be asked to do. The order tick's share is read against
+        /// <see cref="PG_TheOrderTick_LegsOffVersusOn"/> on the same machine.
+        /// </summary>
+        [Test]
+        public void VM3_AbstractSearchCost_Baseline()
+        {
+            TestContext.Out.WriteLine("=== V-M3 — abstract search: cost per search, relaxations, arithmetic unit costs ===");
+            ReportArithmeticUnitCosts();
+            TestContext.Out.WriteLine("");
+
+            var synth = NavAgentTestHelper.CreateOpenFieldNavMesh(FIELD_CELLS);
+            foreach (double cell in new[] { 16.0, 32.0 })
+                ReportSearchCost("Synthetic96", synth, cell);
+
+            string path = Path.Combine(RepoRoot(), FieldAsset);
+            if (!File.Exists(path)) { TestContext.Out.WriteLine($"{FieldAsset}: MISSING"); return; }
+            var field = FPNavMeshSerializer.Deserialize(path);
+            foreach (double cell in new[] { 16.0, 32.0 })
+                ReportSearchCost("Field", field, cell);
         }
 
         #endregion
