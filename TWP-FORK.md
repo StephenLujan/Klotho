@@ -25,6 +25,8 @@ This is TWP's fork of [`xpTURN/Klotho`](https://github.com/xpTURN/Klotho), consu
 |---|---|---|---|
 | `2caf6f6` `fix(litenetlib-transport): guard Stop against concurrent Disconnect` | Upstreamable fix (cherry-picked from `fix/litenet-disconnect-race` @ `a8cdb8e`) | `_stopLock` capture-then-null in `LiteNetLibTransport.Disconnect()`/`Connect()` so concurrent/repeat stops can't orphan the manager's native receive thread. | PR against `xpTURN/Klotho` `main` — _link TBD_ |
 | `6b74133` `chore(twp): repack dist addon with the Disconnect guard baked in` | **TWP-only** (never upstream) | Rebuilds the committed `dist/` core DLL + generator from source (`scripts/klotho-repack.sh`) so the guard is in the consumed binary; adds `dist/.pack-stamp` for the drift guard. | n/a |
+| _pending_ `fix(server-loop): add ownsProcess flag; don't Environment.Exit / hook process signals when embedded` | Upstreamable fix | `ServerLoop` gains `bool ownsProcess = true`. When `false` (an embedded in-process loop), `GracefulShutdown()` does not arm the `Environment.Exit(1)` hard-timeout watchdog and `Run()` does not hook `Console.CancelKeyPress` / `AppDomain.ProcessExit`; the watchdog was also made cancellable so a clean dedicated-server shutdown no longer force-exits. Fixes an embedded host (TWP's in-process Single Player / Host server) being force-killed ~3s after session back-out. Default `true` keeps dedicated-server behaviour unchanged. | PR against `xpTURN/Klotho` `main` — _link TBD_ |
+| _pending_ `chore(twp): repack dist addon with the ownsProcess ServerLoop fix` | **TWP-only** (never upstream) | Repack so the `ServerLoop` change is in the consumed `xpTURN.Klotho.Runtime.dll`; refreshes `dist/.pack-stamp`. | n/a |
 
 ## Build model (hybrid repack — Option A, D31)
 
@@ -50,8 +52,11 @@ detectable.
 4. `dotnet test` from the TWP repo root — determinism/lockstep tests must pass.
 5. Commit the updated submodule + `dist/`; update the TWP submodule pointer.
 
-## Known follow-ups (not in this fork's scope)
+## Resolved follow-ups
 
-- A separate CoreCLR debugger-lock-during-shutdown deadlock on the in-process server's `ServerLoop`
-  thread (distinct from the LiteNetLib leak the guard fixed). Tracked in the TWP repo under
-  `.kiro/specs/hang-on-session-teardown/` and its follow-up spec.
+- **The in-process `ServerLoop` freeze/exit on session back-out — RESOLVED** by the `ownsProcess`
+  fix above. It was originally filed here as "a separate CoreCLR debugger-lock-during-shutdown
+  deadlock," but that was a mis-attribution: the debugger only *amplified* it. The real cause was
+  `ServerLoop.GracefulShutdown()`'s unconditional `Environment.Exit(1)` hard-timeout watchdog, correct
+  for a dedicated server but fatal for TWP's embedded in-process loop. Full write-up in the TWP repo
+  under `.kiro/specs/hang-on-session-teardown/investigation.md` + `.kiro/specs/hang-teardown-debugger-deadlock/`.
