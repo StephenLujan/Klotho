@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.13.1] - 2026-09-09
+
+### Fixed — transport teardown: the manager field is no longer handled outside the lock that guards it
+
+- **Two threads could tear down the same `LiteNetManager` at once.** `LiteNetManager.Stop()` is
+  check-then-act (`if (!_isRunning) return;`) with no internal lock, and `CloseSocket()` walks
+  `_isRunning = false` → `Join()` → `_receiveThread = null` unguarded, so a second caller entering
+  while the first is mid-teardown either returns early — reporting success over a teardown still in
+  flight — or NREs at `_receiveThread.Join()` or `_logicThread.Join()` as the first caller nulls the
+  field between the check and the call. The window is not an instant: `_isRunning` is cleared inside
+  `CloseSocket()`, *after* the loop that shuts down every peer, so it scales with the connected peer
+  count. `LiteNetLibTransport` now serializes teardown on its own lock and takes ownership by
+  capture-then-null, so exactly one caller drives `Stop()` to completion and a concurrent or repeat
+  `Disconnect()` is a no-op. `Stop()` itself runs outside the lock — it joins the receive and logic
+  threads, which must not be done while holding it. Contributed by @StephenLujan in
+  [#10](https://github.com/xpTURN/Klotho/pull/10).
+
+- **Hosting a second session in one process failed to bind the port.** `Listen()` overwrote
+  `_netManager` without stopping the manager already in it. That is reachable, not theoretical:
+  `KlothoSessionFlow.StartHostAndListen` is a per-session entry point and `KlothoSessionDriver`
+  keeps one transport alive across sessions by design, so hosting again arrived with the first
+  manager still running. The abandoned manager kept its receive and logic threads and its bound
+  socket with nothing left referencing it, and the new `Start(port)` then contended with a port the
+  old socket still owned — observed as `Address already in use` on every subsequent attempt, with no
+  recovery short of restarting the application. `Listen()` now stops the previous manager and clears
+  its dead peer registrations before binding.
+
+- **`Connect()` published the manager before starting it,** then re-read the field three times
+  instead of holding a local. A concurrent `Disconnect()` landing before one of those reads threw a
+  `NullReferenceException`; landing after the read that feeds `Start()`, it took the reference, found
+  `_isRunning` still false, no-opped, and nulled the field — leaving a running manager with two
+  threads and a bound socket that nothing referenced and nothing could ever stop, one pair per
+  reconnect attempt. Building and starting the replacement now happen under the same lock, and the
+  local drives the rest.
+
+- **`OnConnectionRequest` read the manager field without a guard.** It is the only listener callback
+  that touches it, and callbacks dispatch on whichever thread called `PollEvents()`, so a
+  `Disconnect()` from another thread could null it mid-dispatch — for the whole of `Stop()`'s joins.
+  It now captures once and rejects the request when the manager is gone: the request object carries
+  its own manager reference, so the check decides the max-connections verdict only, and accepting
+  would have built a peer on a manager being discarded.
+
+  No raw dereference of the field remains — every use is null-conditional, inside the lock, or
+  through a local.
+
+### Fixed — `ServerLoop`: a shutdown that takes its time is no longer force-exited, and an embedded loop no longer owns the process
+
+- **The hard-timeout watchdog fired unconditionally,** so a shutdown that overran
+  `SHUTDOWN_TIMEOUT_MS` (3000 ms) was force-exited with **exit code 1 while proceeding normally** —
+  a normal stop reported as a failure to systemd, Kubernetes or CI. The overrun is structural rather
+  than exceptional: phase 2 waits per straggler room, serially, at `SHUTDOWN_PHASE2_TIMEOUT_MS`
+  (1000 ms) each, so three outstanding rooms consume the entire budget before `ShutdownAllRooms()`,
+  the flush wait and `Disconnect()`'s thread join even start. The watchdog is now cancellable and is
+  released when shutdown completes. Contributed by @StephenLujan in
+  [#11](https://github.com/xpTURN/Klotho/pull/11).
+
+- **`new ServerLoop(..., ownsProcess: false)` for a loop embedded in a host application.** A
+  dedicated server owns its process and may hook `Console.CancelKeyPress` / `AppDomain.ProcessExit`
+  and force-exit; a loop running on a background thread inside a client or host app must do neither.
+  Both were unconditional, so a normal session shutdown force-exited the whole host — and the hook
+  half was worse than it sounds: the Ctrl-C handler sets `e.Cancel = true`, so an embedded loop did
+  not merely observe the host's Ctrl-C, it **swallowed** it, leaving the process up with only the
+  server loop stopped. Defaults to `true`, so every existing dedicated-server caller is unchanged.
+
+  Two obligations come with `false`, both documented on the parameter: the host must call `Stop()`
+  itself, since neither signal is hooked — exiting without it leaves rooms unshut — and a wedged
+  shutdown is no longer cut loose, so the thread running `Run()` can block indefinitely rather than
+  force-exiting.
+
+- **The watchdog is released on every exit path, not just the clean one.** Its cancellation was the
+  last statement in `GracefulShutdown()`, so a throw from any phase skipped it: the watchdog stayed
+  armed, force-exited three seconds later and logged a hard timeout — burying the exception that
+  actually ended the shutdown behind a timeout that never happened. The phases now run under
+  `try`/`finally`.
+
 ## [0.13.0] - 2026-09-08
 
 ### Added — planning in legs, so a long move order stops failing; and a partial path when a search still runs out. Both on by default
