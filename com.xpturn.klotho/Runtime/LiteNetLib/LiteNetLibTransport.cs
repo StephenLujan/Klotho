@@ -17,6 +17,12 @@ namespace xpTURN.Klotho.LiteNetLib
     {
         IKLogger _logger;
         LiteNetManager _netManager;
+        // Serializes manager teardown. LiteNetManager.Stop() is check-then-act (if(!_isRunning) return;)
+        // with no internal lock, and the manager can be stopped from two threads at once (e.g. a server
+        // loop's Run() finally on its loop thread + a caller's Disconnect() on another). Without this
+        // lock the two stops interleave, one skips the thread-join, and the manager's native receive
+        // thread is orphaned (spins at high CPU forever).
+        readonly object _stopLock = new object();
         readonly LiteNetLibPeerMap _peerMap;
         bool _isConnected;
         int _localPeerId;
@@ -101,12 +107,22 @@ namespace xpTURN.Klotho.LiteNetLib
             // interval while IsConnected stays false) leak threads/sockets and the abandoned
             // managers keep retransmitting Connection Requests in the background — the server
             // ends up accepting multiple sockets from the same client (zombie peers).
-            _netManager?.Stop();
-            // The stopped manager's peer registrations are dead. Clear them so a fresh connection to
-            // the same endpoint can re-register its peer id — otherwise a connection kept across a stop
-            // (no Disconnect) leaves a stale id and OnPeerConnected fails to register the new peer.
-            _peerMap.Clear();
-            _isConnected = false;
+            //
+            // Capture-then-null under the same lock Disconnect() uses so this stop can't race a
+            // concurrent Disconnect() (which would double-Stop one manager and skip the thread-join).
+            // The stopped manager's peer registrations are dead, so clear them under the lock too: a
+            // fresh connection to the same endpoint must re-register its peer id — otherwise a
+            // connection kept across a stop (no Disconnect) leaves a stale id and OnPeerConnected fails
+            // to register the new peer.
+            LiteNetManager previous;
+            lock (_stopLock)
+            {
+                previous = _netManager;
+                _netManager = null;
+                _peerMap.Clear();
+                _isConnected = false;
+            }
+            previous?.Stop();
             _netManager = new LiteNetManager(this);
             _netManager.IPv6Enabled = _useIPv6;
             if (!_netManager.Start())
@@ -121,16 +137,28 @@ namespace xpTURN.Klotho.LiteNetLib
 
         public void Disconnect()
         {
-            bool wasConnected = _isConnected;
-            _netManager?.Stop();
-            _netManager = null;
-            _peerMap.Clear();
-            _isConnected = false;
+            // Capture-then-null the manager under the lock so exactly ONE caller owns the reference and
+            // drives Stop() to completion; a concurrent/repeat Disconnect sees mgr == null and no-ops.
+            // Stop() is called OUTSIDE the lock — it joins the receive/logic threads (CloseSocket), which
+            // must not block the lock (and the receive thread never re-enters Disconnect). This makes
+            // Disconnect idempotent and safe against the ServerLoop-thread vs caller-thread teardown race.
+            LiteNetManager mgr;
+            bool wasConnected;
+            lock (_stopLock)
+            {
+                mgr = _netManager;
+                _netManager = null;
+                wasConnected = _isConnected;
+                _isConnected = false;
+                _peerMap.Clear();
 
 #if KLOTHO_FAULT_INJECTION
-            _delayedRecvMessages.Clear();
-            _rttLogged = false;
+                _delayedRecvMessages.Clear();
+                _rttLogged = false;
 #endif
+            }
+
+            mgr?.Stop();
 
             if (!_isServer && wasConnected)
                 OnDisconnected?.Invoke(DisconnectReason.LocalDisconnect);
