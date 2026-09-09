@@ -56,17 +56,27 @@ namespace xpTURN.Klotho.Network
 
         public CancellationToken Token => _cts.Token;
 
+        // Whether this loop owns the host process. A dedicated server (its own executable) owns the
+        // process: it may hook Console.CancelKeyPress / AppDomain.ProcessExit and force-exit via the
+        // GracefulShutdown hard-timeout watchdog. An EMBEDDED loop — run in-process on a background
+        // thread inside a client/host application (e.g. an in-process Single Player / listen server) —
+        // does NOT own the process: force-exiting or hooking process-level signals would tear down the
+        // host application. Defaults to true so existing dedicated-server callers are unchanged.
+        private readonly bool _ownsProcess;
+
         public ServerLoop(
             INetworkTransport transport,
             RoomManager roomManager,
             int tickIntervalMs,
-            IKLogger logger)
+            IKLogger logger,
+            bool ownsProcess = true)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _roomManager = roomManager ?? throw new ArgumentNullException(nameof(roomManager));
             _router = roomManager.Router;
             _tickIntervalMs = tickIntervalMs > 0 ? tickIntervalMs : 25;
             _logger = logger;
+            _ownsProcess = ownsProcess;
             _cts = new CancellationTokenSource();
         }
 
@@ -75,8 +85,13 @@ namespace xpTURN.Klotho.Network
         /// </summary>
         public void Run()
         {
-            Console.CancelKeyPress += OnCancelKeyPress;
-            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            // Only a process-owning (dedicated) server hooks process-level signals; an embedded loop
+            // must not intercept its host application's Ctrl-C / process-exit.
+            if (_ownsProcess)
+            {
+                Console.CancelKeyPress += OnCancelKeyPress;
+                AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+            }
 
             _stopwatch.Start();
             long lastUpdateTime = _stopwatch.ElapsedMilliseconds;
@@ -110,8 +125,11 @@ namespace xpTURN.Klotho.Network
             }
             finally
             {
-                Console.CancelKeyPress -= OnCancelKeyPress;
-                AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+                if (_ownsProcess)
+                {
+                    Console.CancelKeyPress -= OnCancelKeyPress;
+                    AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+                }
                 _stopwatch.Stop();
 
                 GracefulShutdown();
@@ -370,14 +388,33 @@ namespace xpTURN.Klotho.Network
         {
             _logger?.KInformation($"[ServerLoop] Graceful shutdown starting...");
 
-            // Hard timeout: force-exit if the overall shutdown exceeds SHUTDOWN_TIMEOUT_MS
-            var hardTimeout = new Thread(() =>
+            // Hard timeout: force-exit if the overall shutdown exceeds SHUTDOWN_TIMEOUT_MS.
+            //
+            // Only armed when this loop OWNS the process (a dedicated server): force-exiting a
+            // dedicated server whose shutdown wedged is correct. An EMBEDDED loop (run in-process
+            // inside a client/host app) must never call Environment.Exit — that would kill the whole
+            // host application on a normal session end (the in-process Single Player / listen-server
+            // back-out case). See the _ownsProcess field.
+            //
+            // The watchdog is also now CANCELLABLE: when shutdown completes within the timeout it is
+            // signalled and exits without force-quitting. Previously it was fire-and-forget — it fired
+            // Environment.Exit even after a clean, fast shutdown (and, worse, its warning log was
+            // silently dropped if the owner had already disposed the logger by then).
+            ManualResetEventSlim shutdownDone = null;
+            Thread hardTimeout = null;
+            if (_ownsProcess)
             {
-                Thread.Sleep(SHUTDOWN_TIMEOUT_MS);
-                _logger?.KError($"[ServerLoop] Shutdown hard timeout ({SHUTDOWN_TIMEOUT_MS}ms), forcing exit");
-                Environment.Exit(1);
-            }) { IsBackground = true };
-            hardTimeout.Start();
+                shutdownDone = new ManualResetEventSlim(false);
+                hardTimeout = new Thread(() =>
+                {
+                    // Wait for either clean completion (signalled) or the timeout to elapse.
+                    if (shutdownDone.Wait(SHUTDOWN_TIMEOUT_MS))
+                        return; // clean shutdown beat the timeout — do not force-exit
+                    _logger?.KError($"[ServerLoop] Shutdown hard timeout ({SHUTDOWN_TIMEOUT_MS}ms), forcing exit");
+                    Environment.Exit(1);
+                }) { IsBackground = true };
+                hardTimeout.Start();
+            }
 
             // (1) Reject new connections
             _router.StopAccepting();
@@ -400,7 +437,8 @@ namespace xpTURN.Klotho.Network
                 var cd = _pendingCountdowns[i];
                 if (cd.Wait(SHUTDOWN_PHASE2_TIMEOUT_MS))
                     cd.Dispose();
-                // else: leave undisposed — GC + hard-timeout (Environment.Exit) reclaims it.
+                // else: leave undisposed — GC reclaims it (and, for a process-owning server, the
+                // hard-timeout Environment.Exit if this shutdown ultimately wedges).
             }
             _pendingCountdowns.Clear();
 
@@ -411,6 +449,10 @@ namespace xpTURN.Klotho.Network
             _transport.FlushSendQueue();
             Thread.Sleep(SHUTDOWN_FLUSH_WAIT_MS);
             _transport.Disconnect();
+
+            // Shutdown finished within the timeout — release the hard-timeout watchdog so it exits
+            // without force-quitting the process (no-op when embedded: no watchdog was armed).
+            shutdownDone?.Set();
 
             _logger?.KInformation($"[ServerLoop] Graceful shutdown complete.");
         }
